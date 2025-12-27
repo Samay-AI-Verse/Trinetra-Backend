@@ -104,7 +104,12 @@ app = FastAPI(title="Drone Live Location", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5500",  # Local frontend development
+        "http://127.0.0.1:5500",
+        "https://*.netlify.app",  # Netlify deployments (wildcard)
+        os.getenv("FRONTEND_URL", ""),  # Production frontend URL from env
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -481,12 +486,9 @@ async def websocket_locations(websocket: WebSocket) -> None:
             dashboard_clients.discard(websocket)
 
 
-app.mount(
-    "/dashboard",
-    StaticFiles(directory="static", html=True),
-    name="dashboard",
-)
 
+# Dashboard is now served separately on Netlify
+# Keeping /static mount for uploaded files and reports
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # --- PROFESSIONAL PDF GENERATOR ---
