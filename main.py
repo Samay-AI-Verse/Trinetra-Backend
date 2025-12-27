@@ -19,6 +19,9 @@ import shutil
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib import colors
+import cloudinary
+import cloudinary.uploader
+import io
 
 class LocationUpdate(BaseModel):
     lat: float
@@ -71,6 +74,13 @@ try:
     officers_collection = db.get_collection("officers")
 except Exception as e:
     print(f"CRITICAL: Failed to connect to MongoDB: {e}")
+
+# Cloudinary Configuration
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET")
+)
 
 # Pydantic Models for Registration
 class RegistrationSubmit(BaseModel):
@@ -596,6 +606,94 @@ def generate_registration_pdf(data: dict, filename: str):
 
     c.save()
 
+# Helper function to generate PDF to buffer (for Cloudinary upload)
+def generate_registration_pdf_to_buffer(data: dict, buffer: io.BytesIO, photo_url: str, id_card_url: str):
+    """Generate PDF in memory for Cloudinary upload"""
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    
+    # --- 1. Header Section ---
+    c.setFillColor(colors.darkblue)
+    c.rect(0, height - 100, width, 100, fill=1, stroke=0)
+    
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 24)
+    c.drawCentredString(width / 2, height - 50, "MAHARASHTRA POLICE")
+    
+    c.setFont("Helvetica", 12)
+    c.drawCentredString(width / 2, height - 70, "OFFICER REGISTRATION DOSSIER")
+    
+    c.setFont("Helvetica-Oblique", 10)
+    c.drawCentredString(width / 2, height - 85, f"Ref ID: {data.get('request_id', 'N/A')}")
+
+    # --- 2. Officer Photo Placeholder ---
+    photo_x = width - 180
+    photo_y = height - 260
+    photo_w = 120
+    photo_h = 140
+    
+    c.setStrokeColor(colors.black)
+    c.setLineWidth(1)
+    c.rect(photo_x, photo_y, photo_w, photo_h, stroke=1, fill=0)
+    c.setFillColor(colors.gray)
+    c.setFont("Helvetica", 8)
+    c.drawString(photo_x + 10, photo_y + 70, "Photo stored")
+    c.drawString(photo_x + 10, photo_y + 60, "in cloud")
+
+    # --- 3. Officer Details ---
+    c.setFillColor(colors.black)
+    y_pos = height - 140
+    x_pos = 50
+    line_height = 25
+    
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(x_pos, y_pos, "PERSONAL & SERVICE DETAILS")
+    y_pos -= 30
+    
+    fields = [
+        ("Full Name", data.get("full_name")),
+        ("Rank", data.get("rank")),
+        ("Badge Number", data.get("badge_number")),
+        ("Service ID", data.get("service_id")),
+        ("Station Name", data.get("station_name")),
+        ("District", data.get("district")),
+        ("State", data.get("state")),
+        ("Mobile Number", data.get("mobile_number")),
+        ("Official Email", data.get("official_email")),
+        ("Date of Birth", data.get("dob")),
+        ("Biometric", "Enabled" if data.get("biometric_enabled") else "Disabled"),
+    ]
+
+    c.setFont("Helvetica", 11)
+    for label, value in fields:
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(x_pos, y_pos, f"{label}:")
+        c.setFont("Helvetica", 11)
+        c.drawString(x_pos + 120, y_pos, str(value))
+        
+        c.setStrokeColor(colors.lightgrey)
+        c.line(x_pos, y_pos - 5, width - 200, y_pos - 5)
+        
+        y_pos -= line_height
+
+    # --- 4. ID Proof Note ---
+    y_pos -= 30
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(x_pos, y_pos, "ATTACHED IDENTITY PROOF")
+    y_pos -= 20
+    c.setFont("Helvetica", 10)
+    c.drawString(x_pos, y_pos, "ID card stored securely in cloud storage")
+
+    # --- 5. Footer ---
+    c.setStrokeColor(colors.black)
+    c.line(50, 50, width - 50, 50)
+    c.setFont("Helvetica-Oblique", 9)
+    c.drawString(50, 35, f"Generated via TRINETRA Command System | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    c.drawRightString(width - 50, 35, "CONFIDENTIAL")
+
+    c.save()
+
+
 # Registration Endpoints
 @app.post("/api/register")
 async def register_officer(
@@ -615,14 +713,52 @@ async def register_officer(
 ):
     request_id = str(uuid.uuid4())
     
-    # Save files
-    photo_path = f"static/uploads/photos/{request_id}_{photo.filename}"
-    id_card_path = f"static/uploads/docs/{request_id}_{id_card.filename}"
+    # Check if Cloudinary is configured
+    use_cloudinary = all([
+        os.getenv("CLOUDINARY_CLOUD_NAME"),
+        os.getenv("CLOUDINARY_API_KEY"),
+        os.getenv("CLOUDINARY_API_SECRET")
+    ])
     
-    with open(photo_path, "wb") as buffer:
-        shutil.copyfileobj(photo.file, buffer)
-    with open(id_card_path, "wb") as buffer:
-        shutil.copyfileobj(id_card.file, buffer)
+    if use_cloudinary:
+        print(f"📤 Uploading files to Cloudinary for request {request_id}")
+        try:
+            # Upload photo to Cloudinary
+            photo_result = cloudinary.uploader.upload(
+                photo.file,
+                folder="trinetra/photos",
+                public_id=f"{request_id}_photo",
+                resource_type="image"
+            )
+            photo_url = photo_result['secure_url']
+            
+            # Upload ID card to Cloudinary
+            id_card_result = cloudinary.uploader.upload(
+                id_card.file,
+                folder="trinetra/docs",
+                public_id=f"{request_id}_idcard",
+                resource_type="image"
+            )
+            id_card_url = id_card_result['secure_url']
+            
+            print(f"✅ Files uploaded to Cloudinary successfully")
+            
+        except Exception as e:
+            print(f"❌ Cloudinary upload failed: {e}")
+            raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+    else:
+        # Fallback to local storage for development
+        print(f"📁 Saving files locally (Cloudinary not configured)")
+        photo_path = f"static/uploads/photos/{request_id}_{photo.filename}"
+        id_card_path = f"static/uploads/docs/{request_id}_{id_card.filename}"
+        
+        with open(photo_path, "wb") as buffer:
+            shutil.copyfileobj(photo.file, buffer)
+        with open(id_card_path, "wb") as buffer:
+            shutil.copyfileobj(id_card.file, buffer)
+        
+        photo_url = f"/{photo_path}"
+        id_card_url = f"/{id_card_path}"
     
     registration_data = {
         "request_id": request_id,
@@ -637,16 +773,39 @@ async def register_officer(
         "state": state,
         "service_id": service_id,
         "biometric_enabled": biometric_enabled,
-        "photo_path": photo_path,
-        "id_card_path": id_card_path,
+        "photo_path": photo_url,
+        "id_card_path": id_card_url,
         "status": "Pending",
         "created_at": datetime.utcnow().isoformat()
     }
 
     # Generate PDF
-    pdf_path = f"static/reports/{request_id}_report.pdf"
-    generate_registration_pdf(registration_data, pdf_path)
-    registration_data["pdf_path"] = pdf_path
+    if use_cloudinary:
+        # Generate PDF in memory and upload to Cloudinary
+        pdf_buffer = io.BytesIO()
+        generate_registration_pdf_to_buffer(registration_data, pdf_buffer, photo_url, id_card_url)
+        pdf_buffer.seek(0)
+        
+        try:
+            pdf_result = cloudinary.uploader.upload(
+                pdf_buffer,
+                folder="trinetra/reports",
+                public_id=f"{request_id}_report",
+                resource_type="raw",
+                format="pdf"
+            )
+            pdf_url = pdf_result['secure_url']
+            print(f"✅ PDF uploaded to Cloudinary")
+        except Exception as e:
+            print(f"❌ PDF upload failed: {e}")
+            pdf_url = None
+    else:
+        # Save PDF locally
+        pdf_path = f"static/reports/{request_id}_report.pdf"
+        generate_registration_pdf(registration_data, pdf_path)
+        pdf_url = f"/{pdf_path}"
+    
+    registration_data["pdf_path"] = pdf_url
 
     await registration_collection.insert_one(registration_data)
     return {"status": "success", "request_id": request_id}
