@@ -860,20 +860,44 @@ class DeviceReset(BaseModel):
 
 @app.post("/api/send-otp")
 async def send_otp(mobile_number: str):
-    # Generate Real 6-digit OTP
-    import random
-    otp_code = str(random.randint(100000, 999999))
-    expires_at = datetime.utcnow() + timedelta(minutes=5)
+    # Check if demo mode is enabled (for development without Twilio credits)
+    demo_mode = os.getenv("DEMO_OTP_MODE", "false").lower() == "true"
     
-    temp_otps[mobile_number] = OTPData(code=otp_code, expires_at=expires_at)
-    
-    # --- REAL SMS INTEGRATION ---
-    # await send_sms_msg91(mobile_number, otp_code) 
-    await send_sms_twilio(mobile_number, otp_code)
-    
-    print(f"SECURITY: OTP sent to {mobile_number} via Twilio")
-    
-    return {"status": "success", "message": "OTP sent via SMS"}
+    if demo_mode:
+        # DEMO MODE: Use fixed OTP, no SMS sent
+        otp_code = "123456"
+        expires_at = datetime.utcnow() + timedelta(minutes=5)
+        temp_otps[mobile_number] = OTPData(code=otp_code, expires_at=expires_at)
+        
+        print("=" * 60)
+        print(f"🔧 DEMO OTP MODE ACTIVE")
+        print(f"📱 Mobile: {mobile_number}")
+        print(f"🔑 OTP: {otp_code}")
+        print(f"⏰ Expires: {expires_at.strftime('%H:%M:%S UTC')}")
+        print(f"⚠️  No SMS sent - Using demo OTP for testing")
+        print(f"💡 Set DEMO_OTP_MODE=false in .env to use real Twilio SMS")
+        print("=" * 60)
+        
+        return {
+            "status": "success", 
+            "message": "OTP sent (Demo Mode)",
+            "demo_mode": True,
+            "demo_otp": otp_code  # Only exposed in demo mode for easy testing
+        }
+    else:
+        # PRODUCTION MODE: Generate random OTP and send via Twilio
+        import random
+        otp_code = str(random.randint(100000, 999999))
+        expires_at = datetime.utcnow() + timedelta(minutes=5)
+        
+        temp_otps[mobile_number] = OTPData(code=otp_code, expires_at=expires_at)
+        
+        # Send real SMS via Twilio
+        await send_sms_twilio(mobile_number, otp_code)
+        
+        print(f"SECURITY: OTP sent to {mobile_number} via Twilio")
+        
+        return {"status": "success", "message": "OTP sent via SMS"}
 
 # --- SMS Gateway Helpers ---
 
