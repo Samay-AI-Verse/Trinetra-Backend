@@ -1374,6 +1374,13 @@ async def websocket_video_upload(websocket: WebSocket):
         print("Drone Camera Disconnected")
         drone_camera_socket = None
 
+
+@app.get("/")
+def show():
+    return {"hello world.."}
+
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
