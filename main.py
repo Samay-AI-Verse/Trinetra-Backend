@@ -1828,6 +1828,15 @@ async def websocket_video_upload(websocket: WebSocket):
         drone_camera_socket = None
 
 
+<<<<<<< HEAD
+=======
+@app.get("/")
+def show():
+    return {"hello world.."}
+
+
+
+>>>>>>> c832a02bbb2f8fd497e0b289bdb6c386ff791a76
 if __name__ == "__main__":
     import uvicorn
 
