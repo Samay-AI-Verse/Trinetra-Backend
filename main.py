@@ -6,9 +6,17 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Set
 from dotenv import load_dotenv
 
-load_dotenv() # Load environment variables from .env file
+load_dotenv()  # Load environment variables from .env file
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
+from fastapi import (
+    FastAPI,
+    WebSocket,
+    WebSocketDisconnect,
+    UploadFile,
+    File,
+    Form,
+    HTTPException,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -22,6 +30,7 @@ from reportlab.lib import colors
 import cloudinary
 import cloudinary.uploader
 import io
+
 
 class LocationUpdate(BaseModel):
     lat: float
@@ -63,6 +72,21 @@ class OfficerState:
     sos_audio_url: str | None = None
 
 
+@dataclass
+class Notification:
+    notification_id: str
+    notification_type: str  # "emergency" or "normal"
+    title: str
+    message: str
+    target_officer_ids: List[str] | None  # None means broadcast to all
+    source_officer_id: str | None  # For emergency alerts
+    lat: float | None
+    lng: float | None
+    created_at: datetime
+    is_read: bool = False
+    metadata: Dict[str, Any] | None = None
+
+
 # MongoDB Configuration
 MONGO_DETAILS = os.getenv("MONGO_DETAILS", "mongodb://localhost:27017")
 
@@ -77,6 +101,8 @@ try:
     db = client.trinetra_db
     registration_collection = db.get_collection("registrations")
     officers_collection = db.get_collection("officers")
+    notifications_collection = db.get_collection("notifications")
+    sos_collection = db.get_collection("sos_events")
 except Exception as e:
     print(f"CRITICAL: Failed to connect to MongoDB: {e}")
 
@@ -84,8 +110,9 @@ except Exception as e:
 cloudinary.config(
     cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
     api_key=os.getenv("CLOUDINARY_API_KEY"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET")
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
 )
+
 
 # Pydantic Models for Registration
 class RegistrationSubmit(BaseModel):
@@ -101,14 +128,17 @@ class RegistrationSubmit(BaseModel):
     service_id: str
     biometric_enabled: bool = False
 
+
 class OTPVerify(BaseModel):
     mobile_number: str
     otp: str
+
 
 class DeviceBind(BaseModel):
     officer_id: str
     otp: str
     device_id: str
+
 
 class OfficerLogin(BaseModel):
     officer_id: str
@@ -132,9 +162,11 @@ app.add_middleware(
 
 drones: Dict[str, DroneState] = {}
 officers: Dict[str, OfficerState] = {}
+notifications: Dict[str, Notification] = {}  # In-memory notification storage
 dashboard_clients: Set[WebSocket] = set()
 drones_lock = asyncio.Lock()
 officers_lock = asyncio.Lock()
+notifications_lock = asyncio.Lock()
 clients_lock = asyncio.Lock()
 
 STALE_AFTER = timedelta(seconds=90)
@@ -153,7 +185,7 @@ async def load_officers_from_db():
         # Find officers who have a 'last_location' field
         async for doc in officers_collection.find({"last_location": {"$ne": None}}):
             officer_id = doc["officer_id"]
-            
+
             # Determine timestamp (handle ISO string or datetime object)
             last_seen_val = datetime.utcnow()
             if "last_seen" in doc:
@@ -170,9 +202,9 @@ async def load_officers_from_db():
                 officer_id=officer_id,
                 officer_name=doc.get("full_name", "Unknown Officer"),
                 badge_number=doc.get("badge_number"),
-                is_online=False, # Mark as offline initially until they connect
+                is_online=False,  # Mark as offline initially until they connect
                 last_location=doc.get("last_location"),
-                last_seen=last_seen_val
+                last_seen=last_seen_val,
             )
             count += 1
         print(f"Loaded {count} officers from DB.")
@@ -252,6 +284,24 @@ async def list_drones() -> Dict[str, Any]:
         return {"drones": [_serialize_drone(d) for d in drones.values()]}
 
 
+@app.get("/api/officers/ids")
+async def get_all_officer_ids() -> Dict[str, Any]:
+    """
+    Returns a list of all registered officer IDs.
+    Useful for dropdowns, validation, or admin panels.
+    """
+    officer_ids = []
+    try:
+        async for doc in officers_collection.find({}, {"officer_id": 1, "_id": 0}):
+            officer_ids.append(doc["officer_id"])
+        officer_ids.sort()  # Optional: sort alphabetically
+    except Exception as e:
+        print(f"Error fetching officer IDs: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch officer IDs")
+
+    return {"officer_ids": officer_ids}
+
+
 @app.post("/api/drones/{drone_id}/status")
 async def update_status(drone_id: str, payload: StatusUpdate) -> Dict[str, Any]:
     async with drones_lock:
@@ -283,7 +333,7 @@ async def update_status(drone_id: str, payload: StatusUpdate) -> Dict[str, Any]:
         print(f"Drone '{drone_id}' is connected")
     else:
         print(f"Drone '{drone_id}' disconnected")
-        
+
     return {"ok": True}
 
 
@@ -326,13 +376,15 @@ async def ingest_location(drone_id: str, payload: LocationUpdate) -> Dict[str, A
             "heading": payload.heading,
             "timestamp": payload.timestamp.isoformat(),
         }
-
     )
-    print(f"Received location from Drone '{drone_id}': Lat={payload.lat}, Lng={payload.lng}, Speed={payload.speed}")
+    print(
+        f"Received location from Drone '{drone_id}': Lat={payload.lat}, Lng={payload.lng}, Speed={payload.speed}"
+    )
     return {"ok": True}
 
 
 # --- OFFICER LOCATION TRACKING ENDPOINTS ---
+
 
 class OfficerLocationUpdate(BaseModel):
     lat: float
@@ -360,9 +412,10 @@ def _serialize_officer(state: OfficerState) -> Dict[str, Any]:
         "sos_active": state.sos_active,
         "sos_type": state.sos_type,
         "sos_message": state.sos_message,
-        "sos_triggered_at": state.sos_triggered_at.isoformat() if state.sos_triggered_at else None,
+        "sos_triggered_at": (
+            state.sos_triggered_at.isoformat() if state.sos_triggered_at else None
+        ),
     }
-
 
 
 @app.get("/api/officers")
@@ -372,7 +425,9 @@ async def list_officers() -> Dict[str, Any]:
 
 
 @app.post("/api/officers/{officer_id}/status")
-async def update_officer_status(officer_id: str, payload: OfficerStatusUpdate) -> Dict[str, Any]:
+async def update_officer_status(
+    officer_id: str, payload: OfficerStatusUpdate
+) -> Dict[str, Any]:
     async with officers_lock:
         current = officers.get(
             officer_id,
@@ -406,24 +461,28 @@ async def update_officer_status(officer_id: str, payload: OfficerStatusUpdate) -
         print(f"Officer '{officer_id}' ({payload.officer_name}) is online")
     else:
         print(f"Officer '{officer_id}' ({payload.officer_name}) went offline")
-        
+
     return {"ok": True}
 
 
 # --- UPDATED INGEST LOCATION ---
 @app.post("/api/officers/{officer_id}/location")
-async def ingest_officer_location(officer_id: str, payload: OfficerLocationUpdate) -> Dict[str, Any]:
+async def ingest_officer_location(
+    officer_id: str, payload: OfficerLocationUpdate
+) -> Dict[str, Any]:
     print(f"📍 RECEIVED OFFICER LOCATION: {officer_id}")
     print(f"   Lat: {payload.lat}, Lng: {payload.lng}")
     print(f"   Name: {payload.officer_name}, Accuracy: {payload.accuracy}m")
-    
+
     # 1. FILTER: High Accuracy Check (Discard inaccurate GPS data > 50m)
     if payload.accuracy and payload.accuracy > 50.0:
-        print(f"⚠️ Skipping update for {officer_id}: Poor accuracy ({payload.accuracy}m)")
+        print(
+            f"⚠️ Skipping update for {officer_id}: Poor accuracy ({payload.accuracy}m)"
+        )
         return {"ok": False, "reason": "Poor accuracy"}
 
     now = datetime.utcnow()
-    
+
     # 2. PERSISTENCE: Save location to MongoDB immediately
     location_data = {
         "lat": payload.lat,
@@ -431,13 +490,13 @@ async def ingest_officer_location(officer_id: str, payload: OfficerLocationUpdat
         "accuracy": payload.accuracy,
         "timestamp": now.isoformat(),
     }
-    
+
     await officers_collection.update_one(
         {"officer_id": officer_id},
-        {"$set": {"last_location": location_data, "last_seen": now}}
+        {"$set": {"last_location": location_data, "last_seen": now}},
     )
     print(f"✅ Saved to MongoDB")
-    
+
     # 3. MEMORY UPDATE: Update in-memory state
     async with officers_lock:
         state = officers.get(
@@ -457,7 +516,7 @@ async def ingest_officer_location(officer_id: str, payload: OfficerLocationUpdat
         state.last_seen = now
         state.last_location = location_data
         officers[officer_id] = state
-    
+
     print(f"✅ Updated in-memory state")
     print(f"📡 Broadcasting to {len(dashboard_clients)} dashboard clients...")
 
@@ -483,18 +542,21 @@ async def ingest_officer_location(officer_id: str, payload: OfficerLocationUpdat
 
 from math import radians, cos, sin, asin, sqrt
 
+
 def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """Calculate the great circle distance in kilometers between two points"""
     lon1, lat1, lon2, lat2 = map(radians, [lng1, lat1, lng2, lat2])
     dlon = lon2 - lon1
     dlat = lat2 - lat1
-    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
     c = 2 * asin(sqrt(a))
     r = 6371  # Radius of earth in kilometers
     return c * r
 
 
-def find_nearby_officers(officer_id: str, lat: float, lng: float, radius_km: float = 2.0) -> List[str]:
+def find_nearby_officers(
+    officer_id: str, lat: float, lng: float, radius_km: float = 2.0
+) -> List[str]:
     """Find officers within radius_km of the given location"""
     nearby = []
     for oid, officer in officers.items():
@@ -502,9 +564,7 @@ def find_nearby_officers(officer_id: str, lat: float, lng: float, radius_km: flo
             continue
         if officer.last_location:
             distance = calculate_distance(
-                lat, lng,
-                officer.last_location['lat'],
-                officer.last_location['lng']
+                lat, lng, officer.last_location["lat"], officer.last_location["lng"]
             )
             if distance <= radius_km:
                 nearby.append(oid)
@@ -540,37 +600,41 @@ async def trigger_sos(
     """Trigger SOS emergency alert"""
     print(f"🚨 SOS TRIGGERED: Officer {officer_id} ({officer_name})")
     print(f"   Type: {emergency_type}, Location: ({lat}, {lng})")
-    
+
     now = datetime.utcnow()
     audio_url = None
-    
+
     # Handle audio upload
     if audio and emergency_type == "audio_message":
-        use_cloudinary = all([
-            os.getenv("CLOUDINARY_CLOUD_NAME"),
-            os.getenv("CLOUDINARY_API_KEY"),
-            os.getenv("CLOUDINARY_API_SECRET")
-        ])
-        
+        use_cloudinary = all(
+            [
+                os.getenv("CLOUDINARY_CLOUD_NAME"),
+                os.getenv("CLOUDINARY_API_KEY"),
+                os.getenv("CLOUDINARY_API_SECRET"),
+            ]
+        )
+
         if use_cloudinary:
             try:
                 result = cloudinary.uploader.upload(
                     audio.file,
                     folder="trinetra/sos_audio",
                     public_id=f"{officer_id}_{int(now.timestamp())}",
-                    resource_type="auto"
+                    resource_type="auto",
                 )
-                audio_url = result['secure_url']
+                audio_url = result["secure_url"]
                 print(f"✅ Audio uploaded: {audio_url}")
             except Exception as e:
                 print(f"❌ Upload failed: {e}")
         else:
-            audio_path = f"static/uploads/sos_audio/{officer_id}_{int(now.timestamp())}.m4a"
+            audio_path = (
+                f"static/uploads/sos_audio/{officer_id}_{int(now.timestamp())}.m4a"
+            )
             os.makedirs("static/uploads/sos_audio", exist_ok=True)
             with open(audio_path, "wb") as buffer:
                 shutil.copyfileobj(audio.file, buffer)
             audio_url = f"/{audio_path}"
-    
+
     # Update officer state
     async with officers_lock:
         if officer_id in officers:
@@ -594,77 +658,382 @@ async def trigger_sos(
                 sos_message=message_text,
                 sos_audio_url=audio_url,
             )
-    
+
     # Find nearby officers
     nearby_officers = find_nearby_officers(officer_id, lat, lng)
     print(f"📍 {len(nearby_officers)} nearby officers")
-    
+
+    # Create emergency notification
+    notification_id = await create_notification(
+        notification_type="emergency",
+        title=f"🚨 EMERGENCY ALERT - {officer_name}",
+        message=message_text or f"{emergency_type.upper()} triggered by {officer_name}",
+        target_officer_ids=nearby_officers if nearby_officers else None,
+        source_officer_id=officer_id,
+        lat=lat,
+        lng=lng,
+        metadata={
+            "emergency_type": emergency_type,
+            "badge_number": badge_number,
+            "audio_url": audio_url,
+            "audio_duration": audio_duration,
+            "nearby_officers_count": len(nearby_officers),
+        },
+    )
+
     # Save to MongoDB
     try:
         sos_collection = db.get_collection("sos_events")
-        await sos_collection.insert_one({
+        await sos_collection.insert_one(
+            {
+                "officer_id": officer_id,
+                "officer_name": officer_name,
+                "badge_number": badge_number,
+                "lat": lat,
+                "lng": lng,
+                "emergency_type": emergency_type,
+                "message_text": message_text,
+                "audio_url": audio_url,
+                "audio_duration": audio_duration,
+                "nearby_officers": nearby_officers,
+                "notification_id": notification_id,
+                "status": "triggered",
+                "triggered_at": now,
+            }
+        )
+    except Exception as e:
+        print(f"❌ MongoDB error: {e}")
+
+    # Broadcast
+    await broadcast(
+        {
+            "type": "officer_sos_alert",
             "officer_id": officer_id,
             "officer_name": officer_name,
             "badge_number": badge_number,
             "lat": lat,
             "lng": lng,
+            "sos_active": True,
             "emergency_type": emergency_type,
             "message_text": message_text,
             "audio_url": audio_url,
             "audio_duration": audio_duration,
+            "triggered_at": now.isoformat(),
             "nearby_officers": nearby_officers,
-            "status": "triggered",
-            "triggered_at": now,
-        })
-    except Exception as e:
-        print(f"❌ MongoDB error: {e}")
-    
-    # Broadcast
-    await broadcast({
-        "type": "officer_sos_alert",
-        "officer_id": officer_id,
-        "officer_name": officer_name,
-        "badge_number": badge_number,
-        "lat": lat,
-        "lng": lng,
-        "sos_active": True,
-        "emergency_type": emergency_type,
-        "message_text": message_text,
-        "audio_url": audio_url,
-        "audio_duration": audio_duration,
-        "triggered_at": now.isoformat(),
+            "notification_id": notification_id,
+        }
+    )
+
+    return {
+        "ok": True,
         "nearby_officers": nearby_officers,
-    })
-    
-    return {"ok": True, "nearby_officers": nearby_officers}
+        "notification_id": notification_id,
+    }
 
 
 @app.post("/api/officers/{officer_id}/sos/cancel")
 async def cancel_sos(officer_id: str, payload: SOSCancel) -> Dict[str, Any]:
     """Cancel SOS alert"""
     print(f"❌ SOS CANCELED: {officer_id} - {payload.reason}")
-    
+
     async with officers_lock:
         if officer_id in officers:
             officers[officer_id].sos_active = False
             officers[officer_id].sos_triggered_at = None
-    
+
     try:
         sos_collection = db.get_collection("sos_events")
         await sos_collection.update_many(
             {"officer_id": officer_id, "status": "triggered"},
-            {"$set": {"status": "cancelled", "cancelled_at": datetime.utcnow()}}
+            {"$set": {"status": "cancelled", "cancelled_at": datetime.utcnow()}},
         )
     except Exception as e:
         print(f"❌ MongoDB error: {e}")
-    
-    await broadcast({
-        "type": "officer_sos_cancelled",
-        "officer_id": officer_id,
-    })
-    
+
+    await broadcast(
+        {
+            "type": "officer_sos_cancelled",
+            "officer_id": officer_id,
+            "sos_active": False,
+        }
+    )
+
     return {"ok": True}
 
+
+# --- NOTIFICATION SYSTEM ENDPOINTS ---
+
+
+class NotificationCreate(BaseModel):
+    notification_type: str  # "emergency" or "normal"
+    title: str
+    message: str
+    target_officer_ids: List[str] | None = None  # None = broadcast to all
+    source_officer_id: str | None = None
+    lat: float | None = None
+    lng: float | None = None
+    metadata: Dict[str, Any] | None = None
+
+
+async def create_notification(
+    notification_type: str,
+    title: str,
+    message: str,
+    target_officer_ids: List[str] | None = None,
+    source_officer_id: str | None = None,
+    lat: float | None = None,
+    lng: float | None = None,
+    metadata: Dict[str, Any] | None = None,
+) -> str:
+    """Helper function to create and store a notification"""
+    notification_id = str(uuid.uuid4())
+    now = datetime.utcnow()
+
+    notification = Notification(
+        notification_id=notification_id,
+        notification_type=notification_type,
+        title=title,
+        message=message,
+        target_officer_ids=target_officer_ids,
+        source_officer_id=source_officer_id,
+        lat=lat,
+        lng=lng,
+        created_at=now,
+        metadata=metadata,
+    )
+
+    # Store in memory
+    async with notifications_lock:
+        notifications[notification_id] = notification
+
+    # Store in MongoDB
+    try:
+        await notifications_collection.insert_one(
+            {
+                "notification_id": notification_id,
+                "notification_type": notification_type,
+                "title": title,
+                "message": message,
+                "target_officer_ids": target_officer_ids,
+                "source_officer_id": source_officer_id,
+                "lat": lat,
+                "lng": lng,
+                "created_at": now,
+                "is_read": False,
+                "metadata": metadata or {},
+            }
+        )
+    except Exception as e:
+        print(f"❌ Failed to save notification to MongoDB: {e}")
+
+    # Broadcast to dashboard
+    await broadcast(
+        {
+            "type": "notification",
+            "notification_id": notification_id,
+            "notification_type": notification_type,
+            "title": title,
+            "message": message,
+            "target_officer_ids": target_officer_ids,
+            "source_officer_id": source_officer_id,
+            "lat": lat,
+            "lng": lng,
+            "created_at": now.isoformat(),
+            "metadata": metadata,
+        }
+    )
+
+    return notification_id
+
+
+@app.post("/api/notifications/send")
+async def send_notification(payload: NotificationCreate) -> Dict[str, Any]:
+    """Send a notification to specific officers or broadcast to all"""
+    notification_id = await create_notification(
+        notification_type=payload.notification_type,
+        title=payload.title,
+        message=payload.message,
+        target_officer_ids=payload.target_officer_ids,
+        source_officer_id=payload.source_officer_id,
+        lat=payload.lat,
+        lng=payload.lng,
+        metadata=payload.metadata,
+    )
+
+    return {"ok": True, "notification_id": notification_id}
+
+
+@app.get("/api/notifications/all")
+async def get_all_notifications() -> Dict[str, Any]:
+    """Get all notifications for dashboard"""
+    async with notifications_lock:
+        notification_list = []
+        for notif in notifications.values():
+            notification_list.append(
+                {
+                    "notification_id": notif.notification_id,
+                    "notification_type": notif.notification_type,
+                    "title": notif.title,
+                    "message": notif.message,
+                    "target_officer_ids": notif.target_officer_ids,
+                    "source_officer_id": notif.source_officer_id,
+                    "lat": notif.lat,
+                    "lng": notif.lng,
+                    "created_at": notif.created_at.isoformat(),
+                    "is_read": notif.is_read,
+                    "metadata": notif.metadata,
+                }
+            )
+
+    return {"notifications": notification_list}
+
+
+@app.get("/api/notifications/{officer_id}")
+async def get_officer_notifications(officer_id: str) -> Dict[str, Any]:
+    """Get notifications for a specific officer"""
+    async with notifications_lock:
+        officer_notifications = []
+        for notif in notifications.values():
+            # Include if broadcast (None) or officer is in target list
+            if (
+                notif.target_officer_ids is None
+                or officer_id in notif.target_officer_ids
+            ):
+                officer_notifications.append(
+                    {
+                        "notification_id": notif.notification_id,
+                        "notification_type": notif.notification_type,
+                        "title": notif.title,
+                        "message": notif.message,
+                        "source_officer_id": notif.source_officer_id,
+                        "lat": notif.lat,
+                        "lng": notif.lng,
+                        "created_at": notif.created_at.isoformat(),
+                        "is_read": notif.is_read,
+                        "metadata": notif.metadata,
+                    }
+                )
+
+    return {"notifications": officer_notifications}
+
+
+@app.post("/api/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id: str) -> Dict[str, Any]:
+    """Mark a notification as read"""
+    async with notifications_lock:
+        if notification_id in notifications:
+            notifications[notification_id].is_read = True
+
+    try:
+        await notifications_collection.update_one(
+            {"notification_id": notification_id}, {"$set": {"is_read": True}}
+        )
+    except Exception as e:
+        print(f"❌ Failed to update notification in MongoDB: {e}")
+
+    return {"ok": True}
+
+
+# --- TESTING ENDPOINT FOR EMERGENCY SIMULATION ---
+
+
+class EmergencyTest(BaseModel):
+    officer_id: str
+    lat: float
+    lng: float
+    emergency_type: str = "high_emergency"
+    message: str | None = None
+    target_officers: List[str] | None = None  # Added for testing specific targets
+
+
+@app.post("/api/test/emergency")
+async def test_emergency(payload: EmergencyTest) -> Dict[str, Any]:
+    """Testing endpoint to simulate emergency messages"""
+    print(f"🧪 TEST EMERGENCY TRIGGERED")
+    print(f"   Officer: {payload.officer_id}")
+    print(f"   Location: ({payload.lat}, {payload.lng})")
+    print(f"   Type: {payload.emergency_type}")
+
+    now = datetime.utcnow()
+
+    # Update officer state to emergency
+    async with officers_lock:
+        if payload.officer_id in officers:
+            officer = officers[payload.officer_id]
+            officer.sos_active = True
+            officer.sos_triggered_at = now
+            officer.sos_type = payload.emergency_type
+            officer.sos_message = payload.message
+            officer_name = officer.officer_name
+            badge_number = officer.badge_number
+        else:
+            # Create test officer state
+            officer_name = f"Test Officer {payload.officer_id}"
+            badge_number = "TEST-001"
+            officers[payload.officer_id] = OfficerState(
+                officer_id=payload.officer_id,
+                officer_name=officer_name,
+                badge_number=badge_number,
+                is_online=True,
+                last_location={"lat": payload.lat, "lng": payload.lng},
+                last_seen=now,
+                sos_active=True,
+                sos_triggered_at=now,
+                sos_type=payload.emergency_type,
+                sos_message=payload.message,
+            )
+
+    # Determine targets
+    if payload.target_officers:
+        nearby_officers = payload.target_officers
+        print(f"   🎯 Forcing targets: {nearby_officers}")
+    else:
+        # Find nearby officers
+        nearby_officers = find_nearby_officers(
+            payload.officer_id, payload.lat, payload.lng
+        )
+
+    # Create emergency notification
+    notification_id = await create_notification(
+        notification_type="emergency",
+        title=f"🚨 EMERGENCY ALERT - {officer_name}",
+        message=payload.message or f"{payload.emergency_type.upper()} triggered",
+        target_officer_ids=nearby_officers if nearby_officers else None,
+        source_officer_id=payload.officer_id,
+        lat=payload.lat,
+        lng=payload.lng,
+        metadata={
+            "emergency_type": payload.emergency_type,
+            "nearby_officers_count": len(nearby_officers),
+        },
+    )
+
+    # Broadcast SOS alert with emergency flag
+    await broadcast(
+        {
+            "type": "officer_sos_alert",
+            "officer_id": payload.officer_id,
+            "officer_name": officer_name,
+            "badge_number": badge_number,
+            "lat": payload.lat,
+            "lng": payload.lng,
+            "sos_active": True,
+            "emergency_type": payload.emergency_type,
+            "message_text": payload.message,
+            "triggered_at": now.isoformat(),
+            "nearby_officers": nearby_officers,
+            "notification_id": notification_id,
+        }
+    )
+
+    print(f"✅ Test emergency broadcasted")
+
+    return {
+        "ok": True,
+        "message": "Test emergency triggered successfully",
+        "notification_id": notification_id,
+        "nearby_officers": nearby_officers,
+    }
 
 
 @app.websocket("/ws/locations")
@@ -678,12 +1047,10 @@ async def websocket_locations(websocket: WebSocket) -> None:
         drones_snapshot = [_serialize_drone(d) for d in drones.values()]
     async with officers_lock:
         officers_snapshot = [_serialize_officer(o) for o in officers.values()]
-    
-    await websocket.send_json({
-        "type": "snapshot", 
-        "drones": drones_snapshot,
-        "officers": officers_snapshot
-    })
+
+    await websocket.send_json(
+        {"type": "snapshot", "drones": drones_snapshot, "officers": officers_snapshot}
+    )
 
     try:
         while True:
@@ -694,31 +1061,33 @@ async def websocket_locations(websocket: WebSocket) -> None:
             dashboard_clients.discard(websocket)
 
 
-
 # Dashboard is now served separately on Netlify
 # Keeping /static mount for uploaded files and reports
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 # --- PROFESSIONAL PDF GENERATOR ---
 def generate_registration_pdf(data: dict, filename: str):
     c = canvas.Canvas(filename, pagesize=A4)
     width, height = A4
-    
+
     # --- 1. Header Section ---
     # Draw Header Background
     c.setFillColor(colors.darkblue)
     c.rect(0, height - 100, width, 100, fill=1, stroke=0)
-    
+
     # Header Text
     c.setFillColor(colors.white)
     c.setFont("Helvetica-Bold", 24)
     c.drawCentredString(width / 2, height - 50, "MAHARASHTRA POLICE")
-    
+
     c.setFont("Helvetica", 12)
     c.drawCentredString(width / 2, height - 70, "OFFICER REGISTRATION DOSSIER")
-    
+
     c.setFont("Helvetica-Oblique", 10)
-    c.drawCentredString(width / 2, height - 85, f"Ref ID: {data.get('request_id', 'N/A')}")
+    c.drawCentredString(
+        width / 2, height - 85, f"Ref ID: {data.get('request_id', 'N/A')}"
+    )
 
     # --- 2. Officer Photo (Passport Style) ---
     # Position: Top Right, below header
@@ -726,16 +1095,23 @@ def generate_registration_pdf(data: dict, filename: str):
     photo_y = height - 260
     photo_w = 120
     photo_h = 140
-    
+
     # Draw Border for Photo
     c.setStrokeColor(colors.black)
     c.setLineWidth(1)
     c.rect(photo_x, photo_y, photo_w, photo_h, stroke=1, fill=0)
-    
+
     # Try to draw the actual image
     try:
-        if os.path.exists(data['photo_path']):
-            c.drawImage(data['photo_path'], photo_x + 2, photo_y + 2, width=photo_w-4, height=photo_h-4, preserveAspectRatio=True)
+        if os.path.exists(data["photo_path"]):
+            c.drawImage(
+                data["photo_path"],
+                photo_x + 2,
+                photo_y + 2,
+                width=photo_w - 4,
+                height=photo_h - 4,
+                preserveAspectRatio=True,
+            )
         else:
             c.setFillColor(colors.gray)
             c.drawString(photo_x + 10, photo_y + 70, "No Photo")
@@ -747,11 +1123,11 @@ def generate_registration_pdf(data: dict, filename: str):
     y_pos = height - 140
     x_pos = 50
     line_height = 25
-    
+
     c.setFont("Helvetica-Bold", 14)
     c.drawString(x_pos, y_pos, "PERSONAL & SERVICE DETAILS")
     y_pos -= 30
-    
+
     # Define fields to show
     fields = [
         ("Full Name", data.get("full_name")),
@@ -774,11 +1150,11 @@ def generate_registration_pdf(data: dict, filename: str):
         c.drawString(x_pos, y_pos, f"{label}:")
         c.setFont("Helvetica", 11)
         c.drawString(x_pos + 120, y_pos, str(value))
-        
+
         # Draw underline
         c.setStrokeColor(colors.lightgrey)
         c.line(x_pos, y_pos - 5, width - 200, y_pos - 5)
-        
+
         y_pos -= line_height
 
     # --- 4. ID Proof Attachment ---
@@ -786,12 +1162,20 @@ def generate_registration_pdf(data: dict, filename: str):
     c.setFont("Helvetica-Bold", 14)
     c.drawString(x_pos, y_pos, "ATTACHED IDENTITY PROOF")
     y_pos -= 20
-    
+
     try:
-        if os.path.exists(data['id_card_path']):
+        if os.path.exists(data["id_card_path"]):
             # Draw ID card image scaled down to fit bottom
             # Calculate aspect ratio to fit in remaining space
-            c.drawImage(data['id_card_path'], x_pos, 100, width=400, height=200, preserveAspectRatio=True, anchor='sw')
+            c.drawImage(
+                data["id_card_path"],
+                x_pos,
+                100,
+                width=400,
+                height=200,
+                preserveAspectRatio=True,
+                anchor="sw",
+            )
     except Exception:
         c.drawString(x_pos, y_pos - 20, "[ID Image Not Available]")
 
@@ -799,37 +1183,46 @@ def generate_registration_pdf(data: dict, filename: str):
     c.setStrokeColor(colors.black)
     c.line(50, 50, width - 50, 50)
     c.setFont("Helvetica-Oblique", 9)
-    c.drawString(50, 35, f"Generated via TRINETRA Command System | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    c.drawString(
+        50,
+        35,
+        f"Generated via TRINETRA Command System | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
+    )
     c.drawRightString(width - 50, 35, "CONFIDENTIAL")
 
     c.save()
 
+
 # Helper function to generate PDF to buffer (for Cloudinary upload)
-def generate_registration_pdf_to_buffer(data: dict, buffer: io.BytesIO, photo_url: str, id_card_url: str):
+def generate_registration_pdf_to_buffer(
+    data: dict, buffer: io.BytesIO, photo_url: str, id_card_url: str
+):
     """Generate PDF in memory for Cloudinary upload"""
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
-    
+
     # --- 1. Header Section ---
     c.setFillColor(colors.darkblue)
     c.rect(0, height - 100, width, 100, fill=1, stroke=0)
-    
+
     c.setFillColor(colors.white)
     c.setFont("Helvetica-Bold", 24)
     c.drawCentredString(width / 2, height - 50, "MAHARASHTRA POLICE")
-    
+
     c.setFont("Helvetica", 12)
     c.drawCentredString(width / 2, height - 70, "OFFICER REGISTRATION DOSSIER")
-    
+
     c.setFont("Helvetica-Oblique", 10)
-    c.drawCentredString(width / 2, height - 85, f"Ref ID: {data.get('request_id', 'N/A')}")
+    c.drawCentredString(
+        width / 2, height - 85, f"Ref ID: {data.get('request_id', 'N/A')}"
+    )
 
     # --- 2. Officer Photo Placeholder ---
     photo_x = width - 180
     photo_y = height - 260
     photo_w = 120
     photo_h = 140
-    
+
     c.setStrokeColor(colors.black)
     c.setLineWidth(1)
     c.rect(photo_x, photo_y, photo_w, photo_h, stroke=1, fill=0)
@@ -843,11 +1236,11 @@ def generate_registration_pdf_to_buffer(data: dict, buffer: io.BytesIO, photo_ur
     y_pos = height - 140
     x_pos = 50
     line_height = 25
-    
+
     c.setFont("Helvetica-Bold", 14)
     c.drawString(x_pos, y_pos, "PERSONAL & SERVICE DETAILS")
     y_pos -= 30
-    
+
     fields = [
         ("Full Name", data.get("full_name")),
         ("Rank", data.get("rank")),
@@ -868,10 +1261,10 @@ def generate_registration_pdf_to_buffer(data: dict, buffer: io.BytesIO, photo_ur
         c.drawString(x_pos, y_pos, f"{label}:")
         c.setFont("Helvetica", 11)
         c.drawString(x_pos + 120, y_pos, str(value))
-        
+
         c.setStrokeColor(colors.lightgrey)
         c.line(x_pos, y_pos - 5, width - 200, y_pos - 5)
-        
+
         y_pos -= line_height
 
     # --- 4. ID Proof Note ---
@@ -886,7 +1279,11 @@ def generate_registration_pdf_to_buffer(data: dict, buffer: io.BytesIO, photo_ur
     c.setStrokeColor(colors.black)
     c.line(50, 50, width - 50, 50)
     c.setFont("Helvetica-Oblique", 9)
-    c.drawString(50, 35, f"Generated via TRINETRA Command System | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    c.drawString(
+        50,
+        35,
+        f"Generated via TRINETRA Command System | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
+    )
     c.drawRightString(width - 50, 35, "CONFIDENTIAL")
 
     c.save()
@@ -907,17 +1304,19 @@ async def register_officer(
     service_id: str = Form(...),
     biometric_enabled: bool = Form(False),
     photo: UploadFile = File(...),
-    id_card: UploadFile = File(...)
+    id_card: UploadFile = File(...),
 ):
     request_id = str(uuid.uuid4())
-    
+
     # Check if Cloudinary is configured
-    use_cloudinary = all([
-        os.getenv("CLOUDINARY_CLOUD_NAME"),
-        os.getenv("CLOUDINARY_API_KEY"),
-        os.getenv("CLOUDINARY_API_SECRET")
-    ])
-    
+    use_cloudinary = all(
+        [
+            os.getenv("CLOUDINARY_CLOUD_NAME"),
+            os.getenv("CLOUDINARY_API_KEY"),
+            os.getenv("CLOUDINARY_API_SECRET"),
+        ]
+    )
+
     if use_cloudinary:
         print(f"📤 Uploading files to Cloudinary for request {request_id}")
         try:
@@ -926,21 +1325,21 @@ async def register_officer(
                 photo.file,
                 folder="trinetra/photos",
                 public_id=f"{request_id}_photo",
-                resource_type="image"
+                resource_type="image",
             )
-            photo_url = photo_result['secure_url']
-            
+            photo_url = photo_result["secure_url"]
+
             # Upload ID card to Cloudinary
             id_card_result = cloudinary.uploader.upload(
                 id_card.file,
                 folder="trinetra/docs",
                 public_id=f"{request_id}_idcard",
-                resource_type="image"
+                resource_type="image",
             )
-            id_card_url = id_card_result['secure_url']
-            
+            id_card_url = id_card_result["secure_url"]
+
             print(f"✅ Files uploaded to Cloudinary successfully")
-            
+
         except Exception as e:
             print(f"❌ Cloudinary upload failed: {e}")
             raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
@@ -949,15 +1348,15 @@ async def register_officer(
         print(f"📁 Saving files locally (Cloudinary not configured)")
         photo_path = f"static/uploads/photos/{request_id}_{photo.filename}"
         id_card_path = f"static/uploads/docs/{request_id}_{id_card.filename}"
-        
+
         with open(photo_path, "wb") as buffer:
             shutil.copyfileobj(photo.file, buffer)
         with open(id_card_path, "wb") as buffer:
             shutil.copyfileobj(id_card.file, buffer)
-        
+
         photo_url = f"/{photo_path}"
         id_card_url = f"/{id_card_path}"
-    
+
     registration_data = {
         "request_id": request_id,
         "full_name": full_name,
@@ -974,25 +1373,27 @@ async def register_officer(
         "photo_path": photo_url,
         "id_card_path": id_card_url,
         "status": "Pending",
-        "created_at": datetime.utcnow().isoformat()
+        "created_at": datetime.utcnow().isoformat(),
     }
 
     # Generate PDF
     if use_cloudinary:
         # Generate PDF in memory and upload to Cloudinary
         pdf_buffer = io.BytesIO()
-        generate_registration_pdf_to_buffer(registration_data, pdf_buffer, photo_url, id_card_url)
+        generate_registration_pdf_to_buffer(
+            registration_data, pdf_buffer, photo_url, id_card_url
+        )
         pdf_buffer.seek(0)
-        
+
         try:
             pdf_result = cloudinary.uploader.upload(
                 pdf_buffer,
                 folder="trinetra/reports",
                 public_id=f"{request_id}_report",
                 resource_type="raw",
-                format="pdf"
+                format="pdf",
             )
-            pdf_url = pdf_result['secure_url']
+            pdf_url = pdf_result["secure_url"]
             print(f"✅ PDF uploaded to Cloudinary")
         except Exception as e:
             print(f"❌ PDF upload failed: {e}")
@@ -1002,11 +1403,12 @@ async def register_officer(
         pdf_path = f"static/reports/{request_id}_report.pdf"
         generate_registration_pdf(registration_data, pdf_path)
         pdf_url = f"/{pdf_path}"
-    
+
     registration_data["pdf_path"] = pdf_url
 
     await registration_collection.insert_one(registration_data)
     return {"status": "success", "request_id": request_id}
+
 
 @app.get("/api/admin/requests")
 async def get_registration_requests():
@@ -1016,12 +1418,13 @@ async def get_registration_requests():
         requests.append(req)
     return {"requests": requests}
 
+
 @app.post("/api/admin/approve/{request_id}")
 async def approve_registration(request_id: str):
     req = await registration_collection.find_one({"request_id": request_id})
     if not req:
         raise HTTPException(status_code=404, detail="Request not found")
-    
+
     # Generate officer ID (No password needed for passwordless auth)
     officer_id = f"POL-{uuid.uuid4().hex[:6].upper()}"
 
@@ -1030,18 +1433,21 @@ async def approve_registration(request_id: str):
         "full_name": req["full_name"],
         "mobile_number": req["mobile_number"],
         "badge_number": req["badge_number"],
-        "device_id": None, # Will be set during device binding
+        "device_id": None,  # Will be set during device binding
         "status": "Active",
-        "created_at": datetime.utcnow().isoformat()
+        "created_at": datetime.utcnow().isoformat(),
     }
 
     await officers_collection.insert_one(officer_data)
-    await registration_collection.update_one({"request_id": request_id}, {"$set": {"status": "Approved"}})
+    await registration_collection.update_one(
+        {"request_id": request_id}, {"$set": {"status": "Approved"}}
+    )
 
     # In a real app, send registration success notification here
     print(f"APPROVE: Officer ID assigned: {officer_id} for {req['official_email']}")
 
     return {"status": "approved", "officer_id": officer_id}
+
 
 # OTP Storage with Expiry
 @dataclass
@@ -1049,24 +1455,27 @@ class OTPData:
     code: str
     expires_at: datetime
 
+
 temp_otps: Dict[str, OTPData] = {}
+
 
 class DeviceReset(BaseModel):
     mobile_number: str
     otp: str
     badge_number: str
 
+
 @app.post("/api/send-otp")
 async def send_otp(mobile_number: str):
     # Check if demo mode is enabled (for development without Twilio credits)
     demo_mode = os.getenv("DEMO_OTP_MODE", "false").lower() == "true"
-    
+
     if demo_mode:
         # DEMO MODE: Use fixed OTP, no SMS sent
         otp_code = "123456"
         expires_at = datetime.utcnow() + timedelta(minutes=5)
         temp_otps[mobile_number] = OTPData(code=otp_code, expires_at=expires_at)
-        
+
         print("=" * 60)
         print(f"🔧 DEMO OTP MODE ACTIVE")
         print(f"📱 Mobile: {mobile_number}")
@@ -1075,29 +1484,32 @@ async def send_otp(mobile_number: str):
         print(f"⚠️  No SMS sent - Using demo OTP for testing")
         print(f"💡 Set DEMO_OTP_MODE=false in .env to use real Twilio SMS")
         print("=" * 60)
-        
+
         return {
-            "status": "success", 
+            "status": "success",
             "message": "OTP sent (Demo Mode)",
             "demo_mode": True,
-            "demo_otp": otp_code  # Only exposed in demo mode for easy testing
+            "demo_otp": otp_code,  # Only exposed in demo mode for easy testing
         }
     else:
         # PRODUCTION MODE: Generate random OTP and send via Twilio
         import random
+
         otp_code = str(random.randint(100000, 999999))
         expires_at = datetime.utcnow() + timedelta(minutes=5)
-        
+
         temp_otps[mobile_number] = OTPData(code=otp_code, expires_at=expires_at)
-        
+
         # Send real SMS via Twilio
         await send_sms_twilio(mobile_number, otp_code)
-        
+
         print(f"SECURITY: OTP sent to {mobile_number} via Twilio")
-        
+
         return {"status": "success", "message": "OTP sent via SMS"}
 
+
 # --- SMS Gateway Helpers ---
+
 
 async def send_sms_msg91(mobile: str, otp: str):
     """
@@ -1105,12 +1517,13 @@ async def send_sms_msg91(mobile: str, otp: str):
     Requires: MSG91_AUTH_KEY, TEMPLATE_ID (DLT Approved)
     """
     import httpx
+
     url = "https://control.msg91.com/api/v5/otp"
     payload = {
         "template_id": "YOUR_DLT_TEPLATE_ID",
         "mobile": "91" + mobile,
         "authkey": "YOUR_MSG91_AUTH_KEY",
-        "otp": otp
+        "otp": otp,
     }
     try:
         async with httpx.AsyncClient() as client:
@@ -1118,98 +1531,117 @@ async def send_sms_msg91(mobile: str, otp: str):
     except Exception as e:
         print(f"SMS Error: {e}")
 
+
 async def send_sms_twilio(mobile: str, otp: str):
     try:
         from twilio.rest import Client
         import os
-        
+
         account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
         auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
-        from_number = os.environ.get("TWILIO_FROM_NUMBER") # e.g., +1234567890
+        from_number = os.environ.get("TWILIO_FROM_NUMBER")  # e.g., +1234567890
 
         if not account_sid or not auth_token or not from_number:
-            print("Twilio Config Missing: Please set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_NUMBER")
+            print(
+                "Twilio Config Missing: Please set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_NUMBER"
+            )
             return
 
         client = Client(account_sid, auth_token)
-        
+
         # Ensure mobile number has country code (Assuming India +91 for now if missing)
         to_number = mobile if mobile.startswith("+") else f"+91{mobile}"
 
         message = client.messages.create(
             body=f"Your Trinetra Verification Code is: {otp}",
             from_=from_number,
-            to=to_number
+            to=to_number,
         )
         print(f"Twilio SMS Sent: SID {message.sid}")
-        
+
     except Exception as e:
         print(f"Twilio Error: {e}")
+
 
 @app.post("/api/verify-otp")
 async def verify_otp(payload: OTPVerify):
     otp_data = temp_otps.get(payload.mobile_number)
-    
+
     if not otp_data:
-         raise HTTPException(status_code=400, detail="OTP not requested or expired")
-    
+        raise HTTPException(status_code=400, detail="OTP not requested or expired")
+
     if datetime.utcnow() > otp_data.expires_at:
         del temp_otps[payload.mobile_number]
         raise HTTPException(status_code=400, detail="OTP expired")
-        
+
     if otp_data.code != payload.otp:
         raise HTTPException(status_code=400, detail="Invalid OTP")
-    
+
     # OTP is valid. Check if officer exists.
-    officer = await officers_collection.find_one({"mobile_number": payload.mobile_number})
-    
+    officer = await officers_collection.find_one(
+        {"mobile_number": payload.mobile_number}
+    )
+
     if not officer:
         return {"status": "verified", "registered": False}
-        
-    return {"status": "verified", "registered": True, "officer_id": officer["officer_id"]}
+
+    return {
+        "status": "verified",
+        "registered": True,
+        "officer_id": officer["officer_id"],
+    }
+
 
 @app.post("/api/officer/bind-device")
 async def bind_device(payload: DeviceBind):
     # 1. Validate OTP again to ensure the request is fresh and authenticated
     officer = await officers_collection.find_one({"officer_id": payload.officer_id})
     if not officer:
-         raise HTTPException(status_code=404, detail="Officer not found")
-    
+        raise HTTPException(status_code=404, detail="Officer not found")
+
     otp_data = temp_otps.get(officer["mobile_number"])
     if not otp_data or otp_data.code != payload.otp:
-         raise HTTPException(status_code=400, detail="Invalid or expired OTP for binding")
+        raise HTTPException(
+            status_code=400, detail="Invalid or expired OTP for binding"
+        )
 
     # 2. Enforce "One Device Per Officer"
     current_device = officer.get("device_id")
     if current_device and current_device != payload.device_id:
         if current_device != payload.device_id:
             raise HTTPException(
-                status_code=403, 
-                detail="Account already bound to another device. Use 'Lost Device' recovery to reset."
+                status_code=403,
+                detail="Account already bound to another device. Use 'Lost Device' recovery to reset.",
             )
 
     # 3. Enforce Global "One Officer Per Device"
-    existing_binding = await officers_collection.find_one({"device_id": payload.device_id})
+    existing_binding = await officers_collection.find_one(
+        {"device_id": payload.device_id}
+    )
     if existing_binding and existing_binding["officer_id"] != payload.officer_id:
-        raise HTTPException(status_code=403, detail="This device is already registered to another officer.")
+        raise HTTPException(
+            status_code=403,
+            detail="This device is already registered to another officer.",
+        )
 
     # 4. Bind
     await officers_collection.update_one(
-        {"officer_id": payload.officer_id}, 
-        {"$set": {"device_id": payload.device_id, "last_login": datetime.utcnow()}}
+        {"officer_id": payload.officer_id},
+        {"$set": {"device_id": payload.device_id, "last_login": datetime.utcnow()}},
     )
-    
+
     # Clear OTP after successful binding
     if officer["mobile_number"] in temp_otps:
         del temp_otps[officer["mobile_number"]]
-    
+
     return {
-        "status": "success", 
+        "status": "success",
         "officer": {
-            "officer_id": officer["officer_id"], 
-            "full_name": officer["full_name"]
-        }
+            "officer_id": officer["officer_id"],
+            "full_name": officer["full_name"],
+        },
     }
+
 
 @app.post("/api/officer/reset-device")
 async def reset_device(payload: DeviceReset):
@@ -1219,26 +1651,33 @@ async def reset_device(payload: DeviceReset):
     # 1. Verify OTP
     otp_data = temp_otps.get(payload.mobile_number)
     if not otp_data or otp_data.code != payload.otp:
-         raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
 
     # 2. Verify Officer and Badge Number
-    officer = await officers_collection.find_one({
-        "mobile_number": payload.mobile_number,
-        "badge_number": payload.badge_number # strict check
-    })
-    
+    officer = await officers_collection.find_one(
+        {
+            "mobile_number": payload.mobile_number,
+            "badge_number": payload.badge_number,  # strict check
+        }
+    )
+
     if not officer:
         raise HTTPException(status_code=404, detail="Officer details mismatch")
-        
+
     # 3. Reset Device ID
     await officers_collection.update_one(
-        {"_id": officer["_id"]},
-        {"$set": {"device_id": None}}
+        {"_id": officer["_id"]}, {"$set": {"device_id": None}}
     )
-    
-    print(f"SECURITY: Device reset for Officer {officer['full_name']} (ID: {officer['officer_id']})")
-    
-    return {"status": "success", "message": "Device binding cleared. You can now login on a new device."}
+
+    print(
+        f"SECURITY: Device reset for Officer {officer['full_name']} (ID: {officer['officer_id']})"
+    )
+
+    return {
+        "status": "success",
+        "message": "Device binding cleared. You can now login on a new device.",
+    }
+
 
 @app.post("/api/check-device")
 async def check_device(payload: dict):
@@ -1249,32 +1688,38 @@ async def check_device(payload: dict):
     device_id = payload.get("device_id")
     if not device_id:
         raise HTTPException(status_code=400, detail="Device ID required")
-    
+
     # Find officer with this device
     officer = await officers_collection.find_one({"device_id": device_id})
-    
+
     if officer:
         return {
             "registered": True,
             "mobile_number": officer["mobile_number"],
-            "officer_id": officer["officer_id"]
+            "officer_id": officer["officer_id"],
         }
-    
+
     return {"registered": False}
+
 
 @app.post("/api/officer/validate-device")
 async def validate_device(login: OfficerLogin):
     officer = await officers_collection.find_one({"officer_id": login.officer_id})
     if not officer:
         raise HTTPException(status_code=401, detail="Invalid Officer ID")
-    
+
     # If device_id is None, they must re-bind (likely reset happened)
     if not officer.get("device_id"):
-         raise HTTPException(status_code=403, detail="Device not bound. Please login again.")
-    
+        raise HTTPException(
+            status_code=403, detail="Device not bound. Please login again."
+        )
+
     if officer["device_id"] != login.device_id:
-        raise HTTPException(status_code=403, detail="Unauthorized device. Please use your registered device.")
-    
+        raise HTTPException(
+            status_code=403,
+            detail="Unauthorized device. Please use your registered device.",
+        )
+
     return {"status": "authorized", "full_name": officer["full_name"]}
 
 
@@ -1285,48 +1730,55 @@ async def get_officer_details(officer_id: str):
     This combines data from officers collection and registration collection.
     """
     print(f"DEBUG: Fetching details for officer_id: {officer_id}")
-    
+
     # Get basic officer data
     officer = await officers_collection.find_one({"officer_id": officer_id})
     if not officer:
         print(f"DEBUG: Officer {officer_id} not found in officers collection")
         raise HTTPException(status_code=404, detail="Officer not found")
-    
-    print(f"DEBUG: Found officer: {officer.get('full_name')}, mobile: {officer.get('mobile_number')}")
-    
+
+    print(
+        f"DEBUG: Found officer: {officer.get('full_name')}, mobile: {officer.get('mobile_number')}"
+    )
+
     # Get full registration data (includes photo, rank, station, etc.)
-    registration = await registration_collection.find_one({
-        "mobile_number": officer["mobile_number"],
-        "status": "Approved"
-    })
-    
+    registration = await registration_collection.find_one(
+        {"mobile_number": officer["mobile_number"], "status": "Approved"}
+    )
+
     if registration:
-        print(f"DEBUG: Found registration data with photo: {registration.get('photo_path')}")
+        print(
+            f"DEBUG: Found registration data with photo: {registration.get('photo_path')}"
+        )
     else:
-        print(f"DEBUG: No approved registration found for mobile: {officer.get('mobile_number')}")
-    
+        print(
+            f"DEBUG: No approved registration found for mobile: {officer.get('mobile_number')}"
+        )
+
     # Combine data
     officer_details = {
         "officer_id": officer["officer_id"],
         "full_name": officer["full_name"],
         "mobile_number": officer["mobile_number"],
         "badge_number": officer["badge_number"],
-        "status": officer.get("status", "Active")
+        "status": officer.get("status", "Active"),
     }
-    
+
     # Add registration details if available
     if registration:
-        officer_details.update({
-            "rank": registration.get("rank"),
-            "station_name": registration.get("station_name"),
-            "district": registration.get("district"),
-            "state": registration.get("state"),
-            "official_email": registration.get("official_email"),
-            "photo_path": registration.get("photo_path"),
-            "service_id": registration.get("service_id"),
-            "dob": registration.get("dob")
-        })
-    
+        officer_details.update(
+            {
+                "rank": registration.get("rank"),
+                "station_name": registration.get("station_name"),
+                "district": registration.get("district"),
+                "state": registration.get("state"),
+                "official_email": registration.get("official_email"),
+                "photo_path": registration.get("photo_path"),
+                "service_id": registration.get("service_id"),
+                "dob": registration.get("dob"),
+            }
+        )
+
     print(f"DEBUG: Returning officer details: {officer_details}")
     return officer_details
 
@@ -1335,10 +1787,10 @@ def get_app() -> FastAPI:
     return app
 
 
-
 video_viewers: Set[WebSocket] = set()
 # Store the drone connection (The Sender)
 drone_camera_socket: WebSocket | None = None
+
 
 @app.websocket("/ws/video/feed")
 async def websocket_video_feed(websocket: WebSocket):
@@ -1351,6 +1803,7 @@ async def websocket_video_feed(websocket: WebSocket):
     except WebSocketDisconnect:
         video_viewers.discard(websocket)
 
+
 @app.websocket("/ws/video/upload")
 async def websocket_video_upload(websocket: WebSocket):
     # This endpoint is for the DRONE to upload frames
@@ -1358,12 +1811,12 @@ async def websocket_video_upload(websocket: WebSocket):
     await websocket.accept()
     drone_camera_socket = websocket
     print("Drone Camera Connected!")
-    
+
     try:
         while True:
             # Receive raw bytes (the image frame)
             data = await websocket.receive_bytes()
-            
+
             # Broadcast to all viewers IMMEDIATELY
             for viewer in list(video_viewers):
                 try:
@@ -1374,6 +1827,8 @@ async def websocket_video_upload(websocket: WebSocket):
         print("Drone Camera Disconnected")
         drone_camera_socket = None
 
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
