@@ -113,6 +113,226 @@ cloudinary.config(
     api_secret=os.getenv("CLOUDINARY_API_SECRET"),
 )
 
+# Firebase Admin SDK Configuration
+import firebase_admin
+from firebase_admin import credentials, messaging
+
+firebase_app = None
+try:
+    # Try to load service account key
+    service_account_path = os.getenv(
+        "FIREBASE_SERVICE_ACCOUNT_PATH", "firebase-service-account.json"
+    )
+    if os.path.exists(service_account_path):
+        cred = credentials.Certificate(service_account_path)
+        firebase_app = firebase_admin.initialize_app(cred)
+        print("✅ Firebase Admin SDK initialized successfully")
+    else:
+        print(f"⚠️ Firebase service account file not found at: {service_account_path}")
+        print("   FCM push notifications will not be available")
+except Exception as e:
+    print(f"⚠️ Firebase initialization failed: {e}")
+    print("   FCM push notifications will not be available")
+
+
+# --- HUGGING FACE DETECTION CONFIG ---
+HUGGING_FACE_API_KEY = (
+    "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"  # REPLACE WITH YOUR API KEY
+)
+HF_MODEL_ID = "facebook/detr-resnet-50"
+HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
+
+import requests
+
+
+@app.post("/api/detect/huggingface")
+async def detect_objects_hf(file: UploadFile = File(...)):
+    """
+    Detect objects using Hugging Face Inference API.
+    Upload an image file (JPEG/PNG).
+    Returns list of detected objects with bounding boxes.
+    """
+    if HUGGING_FACE_API_KEY == "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":
+        print("⚠️ WARNING: Hugging Face API Key is not set!")
+        return {"error": "API Key not configured", "detections": []}
+
+    try:
+        image_bytes = await file.read()
+        headers = {"Authorization": f"Bearer {HUGGING_FACE_API_KEY}"}
+
+        response = requests.post(HF_API_URL, headers=headers, data=image_bytes)
+
+        if response.status_code != 200:
+            print(f"❌ HF API Error: {response.status_code} - {response.text}")
+            return {"error": f"HF API Error: {response.text}", "detections": []}
+
+        detections = response.json()
+        # Filter for 'person' label if needed, or return all
+        # DETR returns generic labels (person, car, etc)
+
+        # Format response for easier Flutter consumption if necessary
+        # Usually returns list of dicts: {'score': 0.99, 'label': 'person', 'box': {'xmin': 100, ...}}
+
+        return {"detections": detections}
+
+    except Exception as e:
+        print(f"❌ Detection failed: {e}")
+        return {"error": str(e), "detections": []}
+
+
+# --- FCM HELPER FUNCTIONS ---
+
+
+class FCMTokenUpdate(BaseModel):
+    fcm_token: str
+
+
+async def send_fcm_emergency_alert(
+    officer_id: str,
+    officer_name: str,
+    badge_number: str,
+    lat: float,
+    lng: float,
+    emergency_type: str,
+    message_text: str = None,
+):
+    """Send FCM push notification to nearby officers"""
+    if not firebase_app:
+        print("⚠️ Firebase not initialized, cannot send FCM")
+        return {"error": "Firebase not initialized"}
+
+    # Get nearby officers
+    nearby_officers = find_nearby_officers(officer_id, lat, lng)
+    if not nearby_officers:
+        print("ℹ️ No nearby officers found")
+        return {"sent": 0, "reason": "No nearby officers"}
+
+    # Get FCM tokens of nearby officers
+    tokens = []
+    for oid in nearby_officers:
+        try:
+            doc = await officers_collection.find_one({"officer_id": oid})
+            if doc and "fcm_token" in doc:
+                tokens.append(doc["fcm_token"])
+        except Exception as e:
+            print(f"⚠️ Error fetching token for {oid}: {e}")
+
+    if not tokens:
+        print("ℹ️ No FCM tokens found for nearby officers")
+        return {"sent": 0, "reason": "No FCM tokens found"}
+
+    # Create FCM message
+    notification_title = f"🚨 EMERGENCY - {officer_name}"
+    notification_body = (
+        message_text or f"{emergency_type.upper()} alert from {officer_name}"
+    )
+
+    message = messaging.MulticastMessage(
+        notification=messaging.Notification(
+            title=notification_title,
+            body=notification_body,
+        ),
+        data={
+            "officer_id": officer_id,
+            "officer_name": officer_name,
+            "badge_number": badge_number or "",
+            "lat": str(lat),
+            "lng": str(lng),
+            "emergency_type": emergency_type,
+            "type": "emergency_alert",
+            "click_action": "FLUTTER_NOTIFICATION_CLICK",
+        },
+        android=messaging.AndroidConfig(
+            priority="high",
+            notification=messaging.AndroidNotification(
+                channel_id="emergency_channel",
+                priority="max",
+                sound="default",
+            ),
+        ),
+        tokens=tokens,
+    )
+
+    # Send message
+    try:
+        response = messaging.send_multicast(message)
+        print(f"✅ FCM sent: {response.success_count}/{len(tokens)} successful")
+        return {
+            "sent": response.success_count,
+            "failed": response.failure_count,
+            "total_tokens": len(tokens),
+        }
+    except Exception as e:
+        print(f"❌ FCM send failed: {e}")
+        return {"error": str(e)}
+
+
+async def send_fcm_normal_notification(
+    title: str,
+    message: str,
+    target_officer_ids: List[str] = None,
+):
+    """Send FCM push notification for normal notifications"""
+    if not firebase_app:
+        return {"error": "Firebase not initialized"}
+
+    # Get FCM tokens
+    tokens = []
+    if target_officer_ids:
+        # Send to specific officers
+        for oid in target_officer_ids:
+            try:
+                doc = await officers_collection.find_one({"officer_id": oid})
+                if doc and "fcm_token" in doc:
+                    tokens.append(doc["fcm_token"])
+            except Exception as e:
+                print(f"⚠️ Error fetching token for {oid}: {e}")
+    else:
+        # Broadcast to all officers
+        try:
+            async for doc in officers_collection.find({"fcm_token": {"$exists": True}}):
+                if "fcm_token" in doc:
+                    tokens.append(doc["fcm_token"])
+        except Exception as e:
+            print(f"⚠️ Error fetching tokens: {e}")
+
+    if not tokens:
+        return {"sent": 0, "reason": "No FCM tokens found"}
+
+    # Create FCM message
+    fcm_message = messaging.MulticastMessage(
+        notification=messaging.Notification(
+            title=title,
+            body=message,
+        ),
+        data={
+            "type": "normal_notification",
+            "title": title,
+            "message": message,
+        },
+        android=messaging.AndroidConfig(
+            priority="high",
+            notification=messaging.AndroidNotification(
+                channel_id="notifications_channel",
+                sound="default",
+            ),
+        ),
+        tokens=tokens,
+    )
+
+    # Send message
+    try:
+        response = messaging.send_multicast(fcm_message)
+        print(f"✅ FCM notification sent: {response.success_count}/{len(tokens)}")
+        return {
+            "sent": response.success_count,
+            "failed": response.failure_count,
+            "total_tokens": len(tokens),
+        }
+    except Exception as e:
+        print(f"❌ FCM send failed: {e}")
+        return {"error": str(e)}
+
 
 # Pydantic Models for Registration
 class RegistrationSubmit(BaseModel):
@@ -538,7 +758,55 @@ async def ingest_officer_location(
     return {"ok": True}
 
 
-# --- SOS EMERGENCY ENDPOINTS ---
+# --- FCM TOKEN MANAGEMENT ---
+
+
+@app.post("/api/officers/{officer_id}/fcm-token")
+async def update_fcm_token(officer_id: str, payload: FCMTokenUpdate) -> Dict[str, Any]:
+    """Store FCM token for push notifications"""
+    print(f"📱 Storing FCM token for officer: {officer_id}")
+    print(f"   Token: {payload.fcm_token[:20]}...")
+
+    try:
+        result = await officers_collection.update_one(
+            {"officer_id": officer_id},
+            {
+                "$set": {
+                    "fcm_token": payload.fcm_token,
+                    "fcm_token_updated_at": datetime.utcnow(),
+                }
+            },
+        )
+
+        if result.modified_count > 0 or result.matched_count > 0:
+            print(f"✅ FCM token stored successfully for {officer_id}")
+            return {"ok": True, "message": "FCM token updated"}
+        else:
+            print(f"⚠️ Officer {officer_id} not found in database")
+            return {"ok": False, "message": "Officer not found"}
+
+    except Exception as e:
+        print(f"❌ FCM token storage failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/officers/{officer_id}/fcm-token")
+async def delete_fcm_token(officer_id: str) -> Dict[str, Any]:
+    """Remove FCM token (e.g., on logout)"""
+    print(f"🗑️ Removing FCM token for officer: {officer_id}")
+
+    try:
+        await officers_collection.update_one(
+            {"officer_id": officer_id},
+            {"$unset": {"fcm_token": "", "fcm_token_updated_at": ""}},
+        )
+        print(f"✅ FCM token removed for {officer_id}")
+        return {"ok": True, "message": "FCM token removed"}
+
+    except Exception as e:
+        print(f"❌ FCM token removal failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 from math import radians, cos, sin, asin, sqrt
 
@@ -724,6 +992,22 @@ async def trigger_sos(
         }
     )
 
+    # Send FCM push notification to nearby officers
+    if firebase_app and nearby_officers:
+        try:
+            fcm_result = await send_fcm_emergency_alert(
+                officer_id=officer_id,
+                officer_name=officer_name,
+                badge_number=badge_number,
+                lat=lat,
+                lng=lng,
+                emergency_type=emergency_type,
+                message_text=message_text,
+            )
+            print(f"📱 FCM emergency alert result: {fcm_result}")
+        except Exception as e:
+            print(f"⚠️ FCM emergency alert failed: {e}")
+
     return {
         "ok": True,
         "nearby_officers": nearby_officers,
@@ -843,6 +1127,23 @@ async def create_notification(
         }
     )
 
+    # Broadcast to officer mobile apps
+    await broadcast_to_officers(
+        {
+            "type": "notification",
+            "notification_id": notification_id,
+            "notification_type": notification_type,
+            "title": title,
+            "message": message,
+            "target_officer_ids": target_officer_ids,
+            "source_officer_id": source_officer_id,
+            "lat": lat,
+            "lng": lng,
+            "created_at": now.isoformat(),
+            "metadata": metadata,
+        }
+    )
+
     return notification_id
 
 
@@ -932,6 +1233,328 @@ async def mark_notification_read(notification_id: str) -> Dict[str, Any]:
         print(f"❌ Failed to update notification in MongoDB: {e}")
 
     return {"ok": True}
+
+
+# --- FIREBASE CLOUD MESSAGING (FCM) ENDPOINTS ---
+
+
+class FCMTokenRegister(BaseModel):
+    officer_id: str
+    fcm_token: str
+    device_info: Dict[str, Any] | None = None
+
+
+class FCMNotificationSend(BaseModel):
+    title: str
+    body: str
+    officer_ids: List[str] | None = None  # None = broadcast to all
+    data: Dict[str, Any] | None = None  # Additional data payload
+    notification_type: str = "normal"  # "normal" or "emergency"
+
+
+@app.post("/api/fcm/register-token")
+async def register_fcm_token(payload: FCMTokenRegister) -> Dict[str, Any]:
+    """
+    Register or update an officer's FCM token for push notifications.
+    This should be called when the app starts and gets a new FCM token.
+    """
+    print(f"📱 Registering FCM token for officer: {payload.officer_id}")
+
+    try:
+        # Store FCM token in MongoDB
+        await officers_collection.update_one(
+            {"officer_id": payload.officer_id},
+            {
+                "$set": {
+                    "fcm_token": payload.fcm_token,
+                    "fcm_token_updated_at": datetime.utcnow(),
+                    "device_info": payload.device_info or {},
+                }
+            },
+        )
+        print(f"✅ FCM token registered for {payload.officer_id}")
+        return {"ok": True, "message": "FCM token registered successfully"}
+    except Exception as e:
+        print(f"❌ Failed to register FCM token: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to register token: {e}")
+
+
+@app.post("/api/fcm/send-notification")
+async def send_fcm_notification(payload: FCMNotificationSend) -> Dict[str, Any]:
+    """
+    Send FCM push notification to specific officers or broadcast to all.
+    This is the main endpoint for sending notifications from the backend.
+    """
+    if not firebase_app:
+        raise HTTPException(
+            status_code=503, detail="Firebase is not initialized. FCM unavailable."
+        )
+
+    print(f"📤 Sending FCM notification: {payload.title}")
+
+    # Get target FCM tokens
+    fcm_tokens = []
+    target_officers = []
+
+    try:
+        if payload.officer_ids:
+            # Send to specific officers
+            async for doc in officers_collection.find(
+                {
+                    "officer_id": {"$in": payload.officer_ids},
+                    "fcm_token": {"$exists": True},
+                }
+            ):
+                if "fcm_token" in doc and doc["fcm_token"]:
+                    fcm_tokens.append(doc["fcm_token"])
+                    target_officers.append(doc["officer_id"])
+        else:
+            # Broadcast to all officers with FCM tokens
+            async for doc in officers_collection.find({"fcm_token": {"$exists": True}}):
+                if "fcm_token" in doc and doc["fcm_token"]:
+                    fcm_tokens.append(doc["fcm_token"])
+                    target_officers.append(doc["officer_id"])
+
+        if not fcm_tokens:
+            return {
+                "ok": False,
+                "message": "No FCM tokens found for target officers",
+                "sent_count": 0,
+            }
+
+        print(f"📡 Sending to {len(fcm_tokens)} devices")
+
+        # Prepare notification data
+        notification_data = payload.data or {}
+        notification_data["notification_type"] = payload.notification_type
+        notification_data["timestamp"] = datetime.utcnow().isoformat()
+
+        # Create FCM message
+        message = messaging.MulticastMessage(
+            notification=messaging.Notification(
+                title=payload.title,
+                body=payload.body,
+            ),
+            data=notification_data,
+            tokens=fcm_tokens,
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    sound="default",
+                    priority="high",
+                    channel_id=(
+                        "trinetra_notifications"
+                        if payload.notification_type == "normal"
+                        else "trinetra_emergency"
+                    ),
+                    color=(
+                        "#00D4FF"
+                        if payload.notification_type == "normal"
+                        else "#DC2626"
+                    ),
+                ),
+            ),
+        )
+
+        # Send the message
+        response = messaging.send_multicast(message)
+
+        print(
+            f"✅ FCM sent: {response.success_count} success, {response.failure_count} failures"
+        )
+
+        # Log failures
+        if response.failure_count > 0:
+            for idx, resp in enumerate(response.responses):
+                if not resp.success:
+                    print(f"❌ Failed to send to token {idx}: {resp.exception}")
+
+        # Store notification in database
+        notification_id = await create_notification(
+            notification_type=payload.notification_type,
+            title=payload.title,
+            message=payload.body,
+            target_officer_ids=target_officers if payload.officer_ids else None,
+            metadata={"fcm_sent": True, "fcm_success_count": response.success_count},
+        )
+
+        return {
+            "ok": True,
+            "message": "Notification sent",
+            "sent_count": response.success_count,
+            "failed_count": response.failure_count,
+            "notification_id": notification_id,
+        }
+
+    except Exception as e:
+        print(f"❌ FCM send error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send notification: {e}")
+
+
+@app.post("/api/fcm/send-emergency")
+async def send_fcm_emergency_alert(
+    officer_id: str = Form(...),
+    officer_name: str = Form(...),
+    badge_number: str = Form(None),
+    lat: float = Form(...),
+    lng: float = Form(...),
+    emergency_type: str = Form(...),
+    message_text: str = Form(None),
+) -> Dict[str, Any]:
+    """
+    Send emergency alert via FCM to nearby officers.
+    This is called when an officer triggers an SOS.
+    """
+    if not firebase_app:
+        print("⚠️ Firebase not initialized, skipping FCM emergency alert")
+        return {"ok": False, "message": "FCM not available"}
+
+    print(f"🚨 Sending FCM emergency alert from {officer_name}")
+
+    # Find nearby officers
+    nearby_officers = find_nearby_officers(officer_id, lat, lng, radius_km=5.0)
+
+    if not nearby_officers:
+        print("⚠️ No nearby officers found for emergency alert")
+        return {"ok": True, "message": "No nearby officers", "sent_count": 0}
+
+    # Get FCM tokens for nearby officers
+    fcm_tokens = []
+    try:
+        async for doc in officers_collection.find(
+            {"officer_id": {"$in": nearby_officers}, "fcm_token": {"$exists": True}}
+        ):
+            if "fcm_token" in doc and doc["fcm_token"]:
+                fcm_tokens.append(doc["fcm_token"])
+
+        if not fcm_tokens:
+            return {
+                "ok": True,
+                "message": "No FCM tokens for nearby officers",
+                "sent_count": 0,
+            }
+
+        # Prepare emergency data
+        emergency_data = {
+            "type": "officer_sos_alert",
+            "officer_id": officer_id,
+            "officer_name": officer_name,
+            "badge_number": badge_number or "",
+            "lat": str(lat),
+            "lng": str(lng),
+            "emergency_type": emergency_type,
+            "message_text": message_text or "",
+            "triggered_at": datetime.utcnow().isoformat(),
+        }
+
+        # Create emergency FCM message
+        message = messaging.MulticastMessage(
+            notification=messaging.Notification(
+                title=f"🚨 EMERGENCY - {officer_name}",
+                body=message_text
+                or f"{emergency_type.upper()} alert from {officer_name}",
+            ),
+            data=emergency_data,
+            tokens=fcm_tokens,
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    sound="default",
+                    priority="max",
+                    channel_id="trinetra_emergency",
+                    color="#DC2626",
+                    default_vibrate_timings=False,
+                    vibrate_timings_millis=[0, 500, 500, 500],
+                ),
+            ),
+        )
+
+        # Send emergency alert
+        response = messaging.send_multicast(message)
+
+        print(
+            f"✅ Emergency FCM sent: {response.success_count} success, {response.failure_count} failures"
+        )
+
+        return {
+            "ok": True,
+            "message": "Emergency alert sent",
+            "sent_count": response.success_count,
+            "failed_count": response.failure_count,
+            "nearby_officers_count": len(nearby_officers),
+        }
+
+    except Exception as e:
+        print(f"❌ Emergency FCM error: {e}")
+        return {"ok": False, "message": f"Failed to send emergency alert: {e}"}
+
+
+# --- WEBSOCKET ENDPOINT FOR REAL-TIME NOTIFICATIONS ---
+
+
+officer_websocket_clients: Set[WebSocket] = set()
+officer_clients_lock = asyncio.Lock()
+
+
+@app.websocket("/ws/notifications")
+async def websocket_notifications(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time notifications to officer apps.
+    Officers connect to this endpoint to receive instant notifications.
+    """
+    await websocket.accept()
+
+    async with officer_clients_lock:
+        officer_websocket_clients.add(websocket)
+
+    print(
+        f"✅ Officer WebSocket connected. Total clients: {len(officer_websocket_clients)}"
+    )
+
+    try:
+        # Keep connection alive and listen for any messages from client
+        while True:
+            # Wait for any message (ping/pong to keep alive)
+            data = await websocket.receive_text()
+            # Echo back to confirm connection is alive
+            await websocket.send_json({"type": "pong", "message": "Connection alive"})
+    except WebSocketDisconnect:
+        async with officer_clients_lock:
+            officer_websocket_clients.discard(websocket)
+        print(
+            f"⚠️ Officer WebSocket disconnected. Remaining clients: {len(officer_websocket_clients)}"
+        )
+    except Exception as e:
+        print(f"❌ WebSocket error: {e}")
+        async with officer_clients_lock:
+            officer_websocket_clients.discard(websocket)
+
+
+async def broadcast_to_officers(message: Dict[str, Any]) -> None:
+    """
+    Broadcast a message to all connected officer WebSocket clients.
+    This is called when a new notification is created.
+    """
+    async with officer_clients_lock:
+        if not officer_websocket_clients:
+            print("⚠️ No officer WebSocket clients connected")
+            return
+
+        closed: List[WebSocket] = []
+        for ws in officer_websocket_clients:
+            try:
+                await ws.send_json(message)
+            except Exception as e:
+                print(f"❌ Failed to send to client: {e}")
+                closed.append(ws)
+
+        # Remove closed connections
+        for ws in closed:
+            officer_websocket_clients.discard(ws)
+
+        print(
+            f"📡 Broadcasted to {len(officer_websocket_clients) - len(closed)} officer clients"
+        )
 
 
 # --- TESTING ENDPOINT FOR EMERGENCY SIMULATION ---
@@ -1828,15 +2451,57 @@ async def websocket_video_upload(websocket: WebSocket):
         drone_camera_socket = None
 
 
-<<<<<<< HEAD
-=======
 @app.get("/")
 def show():
     return {"hello world.."}
 
 
+# --- FCM TESTING ENDPOINT ---
 
->>>>>>> c832a02bbb2f8fd497e0b289bdb6c386ff791a76
+
+@app.post("/api/test/send-notification")
+async def test_send_notification(
+    officer_id: str, title: str = "Test Notification", message: str = "This is a test!"
+) -> Dict[str, Any]:
+    """
+    Test endpoint to send a notification to a specific officer.
+    Usage: POST /api/test/send-notification?officer_id=OFF001&title=Hello&message=Test
+    """
+    print(f"📨 Sending test notification to {officer_id}")
+
+    result = await send_fcm_normal_notification(
+        title=title, message=message, target_officer_ids=[officer_id]
+    )
+
+    return {"ok": True, "fcm_result": result}
+
+
+@app.post("/api/test/send-emergency")
+async def test_send_emergency(
+    officer_id: str,
+    officer_name: str = "Test Officer",
+    lat: float = 28.6139,
+    lng: float = 77.2090,
+) -> Dict[str, Any]:
+    """
+    Test endpoint to send an emergency alert.
+    Usage: POST /api/test/send-emergency?officer_id=OFF001&officer_name=John
+    """
+    print(f"🚨 Sending test emergency alert from {officer_id}")
+
+    result = await send_fcm_emergency_alert(
+        officer_id=officer_id,
+        officer_name=officer_name,
+        badge_number="TEST123",
+        lat=lat,
+        lng=lng,
+        emergency_type="high_emergency",
+        message_text="This is a test emergency alert!",
+    )
+
+    return {"ok": True, "fcm_result": result}
+
+
 if __name__ == "__main__":
     import uvicorn
 
