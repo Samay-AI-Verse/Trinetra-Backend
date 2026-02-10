@@ -19,6 +19,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
@@ -30,6 +31,22 @@ from reportlab.lib import colors
 import cloudinary
 import cloudinary.uploader
 import io
+
+
+app = FastAPI(title="Drone Live Location", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5500",  # Local frontend development
+        "http://127.0.0.1:5500",
+        "https://*.netlify.app",  # Netlify deployments (wildcard)
+        os.getenv("FRONTEND_URL", ""),  # Production frontend URL from env
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class LocationUpdate(BaseModel):
@@ -386,21 +403,6 @@ class OfficerLogin(BaseModel):
     officer_id: str
     device_id: str
 
-
-app = FastAPI(title="Drone Live Location", version="0.1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5500",  # Local frontend development
-        "http://127.0.0.1:5500",
-        "https://*.netlify.app",  # Netlify deployments (wildcard)
-        os.getenv("FRONTEND_URL", ""),  # Production frontend URL from env
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 drones: Dict[str, DroneState] = {}
 officers: Dict[str, OfficerState] = {}
@@ -2473,9 +2475,9 @@ async def websocket_video_upload(websocket: WebSocket):
         drone_camera_socket = None
 
 
-@app.get("/")
-def show():
-    return {"hello world.."}
+@app.get("/dashboard")
+async def show_dashboard():
+    return FileResponse("static/index.html")
 
 
 # --- FCM TESTING ENDPOINT ---
@@ -2522,6 +2524,11 @@ async def test_send_emergency(
     )
 
     return {"ok": True, "fcm_result": result}
+
+
+# Mount static files at root to serve index.html, script.js, style.css
+# This must be the last route defined to act as a fallback for the SPA
+app.mount("/", StaticFiles(directory="static", html=True), name="static_root")
 
 
 if __name__ == "__main__":
