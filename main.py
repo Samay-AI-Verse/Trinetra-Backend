@@ -116,19 +116,38 @@ cloudinary.config(
 # Firebase Admin SDK Configuration
 import firebase_admin
 from firebase_admin import credentials, messaging
+import json
 
 firebase_app = None
 try:
-    # Try to load service account key
+    # 1. Check for JSON content in environment variable (Render/Heroku/Cloud best practice)
+    firebase_json_content = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+
+    # 2. Check for file path in environment variable or default file
     service_account_path = os.getenv(
         "FIREBASE_SERVICE_ACCOUNT_PATH", "firebase-service-account.json"
     )
-    if os.path.exists(service_account_path):
+
+    if firebase_json_content:
+        # Load from JSON string in env var
+        try:
+            cred_dict = json.loads(firebase_json_content)
+            cred = credentials.Certificate(cred_dict)
+            firebase_app = firebase_admin.initialize_app(cred)
+            print("✅ Firebase Admin SDK initialized successfully from ENV JSON")
+        except json.JSONDecodeError as e:
+            print(f"❌ Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON: {e}")
+    elif os.path.exists(service_account_path):
+        # Load from file
         cred = credentials.Certificate(service_account_path)
         firebase_app = firebase_admin.initialize_app(cred)
-        print("✅ Firebase Admin SDK initialized successfully")
+        print(
+            f"✅ Firebase Admin SDK initialized successfully from file: {service_account_path}"
+        )
     else:
-        print(f"⚠️ Firebase service account file not found at: {service_account_path}")
+        print(
+            f"⚠️ Firebase service account not found. Checked env 'FIREBASE_SERVICE_ACCOUNT_JSON' and file '{service_account_path}'"
+        )
         print("   FCM push notifications will not be available")
 except Exception as e:
     print(f"⚠️ Firebase initialization failed: {e}")
@@ -136,8 +155,9 @@ except Exception as e:
 
 
 # --- HUGGING FACE DETECTION CONFIG ---
-HUGGING_FACE_API_KEY = (
-    "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"  # REPLACE WITH YOUR API KEY
+# --- HUGGING FACE DETECTION CONFIG ---
+HUGGING_FACE_API_KEY = os.getenv(
+    "HUGGING_FACE_API_KEY", "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"
 )
 HF_MODEL_ID = "facebook/detr-resnet-50"
 HF_API_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
@@ -152,7 +172,7 @@ async def detect_objects_hf(file: UploadFile = File(...)):
     Upload an image file (JPEG/PNG).
     Returns list of detected objects with bounding boxes.
     """
-    if HUGGING_FACE_API_KEY == "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":
+    if HUGGING_FACE_API_KEY == "hf_lhufSGVUkcRdBEjqWYdEuSKtuTksMyuBDhs":
         print("⚠️ WARNING: Hugging Face API Key is not set!")
         return {"error": "API Key not configured", "detections": []}
 
@@ -166,14 +186,16 @@ async def detect_objects_hf(file: UploadFile = File(...)):
             print(f"❌ HF API Error: {response.status_code} - {response.text}")
             return {"error": f"HF API Error: {response.text}", "detections": []}
 
-        detections = response.json()
-        # Filter for 'person' label if needed, or return all
-        # DETR returns generic labels (person, car, etc)
+        all_detections = response.json()
 
-        # Format response for easier Flutter consumption if necessary
-        # Usually returns list of dicts: {'score': 0.99, 'label': 'person', 'box': {'xmin': 100, ...}}
+        # STRICT FILTER: Only return 'person' label
+        person_detections = [
+            d
+            for d in all_detections
+            if isinstance(d, dict) and d.get("label", "").lower() == "person"
+        ]
 
-        return {"detections": detections}
+        return {"detections": person_detections}
 
     except Exception as e:
         print(f"❌ Detection failed: {e}")
