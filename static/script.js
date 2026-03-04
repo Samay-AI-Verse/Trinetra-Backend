@@ -1,4 +1,27 @@
 // ==========================================
+// 0. API CONFIGURATION
+// ==========================================
+const API_CONFIG = {
+    get baseUrl() {
+        // 1. If served from the backend (port 8000 or production domain), use current origin
+        if (window.location.port === '8000' || (!window.location.host.includes('localhost') && !window.location.host.includes('127.0.0.1'))) {
+            return window.location.origin;
+        }
+
+        // 2. If served from Live Server (port 5500) or file://, point to local backend
+        // You can change this to your ngrok URL if testing cross-device
+        return 'http://localhost:8000';
+        // return 'https://your-ngrok-url.ngrok-free.app'; 
+    },
+
+    get wsUrl() {
+        return this.baseUrl.replace('https://', 'wss://').replace('http://', 'ws://');
+    }
+};
+
+console.log('🔧 API Configuration:', { baseUrl: API_CONFIG.baseUrl, wsUrl: API_CONFIG.wsUrl });
+
+// ==========================================
 // 1. MAP INITIALIZATION & LAYERS
 // ==========================================
 const map = L.map('map', {
@@ -24,8 +47,10 @@ setMapMode(savedMode);
 // layers.dark.addTo(map);  <-- REMOVE THIS LINE completely
 let droneMarkers = {};
 let officerMarkers = {};
+let aiMarkers = {};
 let drones = {};
 let officers = {};
+let aiDevices = {};
 let selectedDroneId = null;
 let selectedOfficerId = null;
 let currentFilter = 'all';
@@ -45,65 +70,144 @@ let dataSocket;
 let videoSocket;
 let lastFrameUrl = null;
 
+// ==========================================
+// WEBSOCKET CONNECTION WITH FULL HANDLERS
+// ==========================================
 function connectWebSocket() {
-    // Use current host (works with both localhost and ngrok)
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host;
-
-    // 1. DATA SOCKET
-    const dataUrl = `${protocol}//${host}/ws/locations`;
+    // 1. DATA SOCKET - Use API_CONFIG for cross-origin support
+    const dataUrl = `${API_CONFIG.wsUrl}/ws/locations`;
     console.log('Connecting to WebSocket:', dataUrl);
 
     dataSocket = new WebSocket(dataUrl);
 
     dataSocket.onopen = () => {
-        console.log('WebSocket connected successfully');
+        console.log('✅ WebSocket connected successfully');
+
+        // Send a ping to keep connection alive
+        setInterval(() => {
+            if (dataSocket.readyState === WebSocket.OPEN) {
+                dataSocket.send(JSON.stringify({ type: 'ping' }));
+            }
+        }, 30000);
     };
 
     dataSocket.onmessage = (event) => {
         try {
             const data = JSON.parse(event.data);
-            console.log('Received WebSocket data:', data);
+            console.log('📡 Received WebSocket data:', data);
 
+            // SNAPSHOT - Initial data load
             if (data.type === 'snapshot') {
-                // Initial snapshot with both drones and officers
-                if (data.drones) {
-                    data.drones.forEach(drone => handleDroneUpdate(drone));
+                console.log('📸 Received snapshot with:', {
+                    drones: data.drones?.length || 0,
+                    officers: data.officers?.length || 0
+                });
+
+                // Handle drones in snapshot
+                if (data.drones && Array.isArray(data.drones)) {
+                    data.drones.forEach(drone => {
+                        console.log('🛸 Drone in snapshot:', drone.drone_id);
+                        handleDroneUpdate(drone);
+                    });
                 }
-                if (data.officers) {
-                    data.officers.forEach(officer => handleOfficerUpdate(officer));
+
+                // Handle officers in snapshot
+                if (data.officers && Array.isArray(data.officers)) {
+                    data.officers.forEach(officer => {
+                        console.log('👮 Officer in snapshot:', officer.officer_id);
+                        handleOfficerUpdate(officer);
+                    });
                 }
-            } else if (data.type === 'location_update' || data.type === 'status') {
+            }
+
+            // DRONE UPDATES
+            else if (data.type === 'location_update') {
+                console.log('🛸 Drone location update:', data.drone_id);
                 handleDroneUpdate(data);
-            } else if (data.type === 'officer_location_update' || data.type === 'officer_status') {
+            }
+            else if (data.type === 'status') {
+                console.log('🛸 Drone status update:', data.drone_id);
+                handleDroneUpdate(data);
+            }
+
+            // OFFICER UPDATES
+            else if (data.type === 'officer_location_update') {
+                console.log('👮 Officer location update:', data.officer_id);
                 handleOfficerUpdate(data);
             }
+            else if (data.type === 'officer_status') {
+                console.log('👮 Officer status update:', data.officer_id);
+                handleOfficerUpdate(data);
+            }
+
+            // SOS ALERTS
+            else if (data.type === 'officer_sos_alert') {
+                console.log('🚨 OFFICER SOS ALERT:', data.officer_id);
+                handleSOSAlert(data);
+            }
+            else if (data.type === 'officer_sos_cancelled') {
+                console.log('✅ OFFICER SOS CANCELLED:', data.officer_id);
+                handleSOSCancelled(data);
+            }
+
+            // AI SURVEILLANCE UPDATES
+            else if (data.type === 'ai_location_update') {
+                console.log('🤖 AI location update:', data.device_id);
+                handleAILocationUpdate(data);
+            }
+            else if (data.type === 'ai_sos_alert') {
+                console.log('🤖🚨 AI SOS ALERT:', data.device_id);
+                handleAISOSAlert(data);
+            }
+
+            // NOTIFICATIONS
+            else if (data.type === 'notification') {
+                console.log('📬 Notification received:', data.notification_id);
+                handleNotification(data);
+            }
+
+            // Unknown message type
+            else {
+                console.log('📡 Unknown message type:', data.type);
+            }
+
         } catch (e) {
-            console.error('Error parsing WebSocket message:', e);
+            console.error('❌ Error parsing WebSocket message:', e);
+            console.error('Raw message:', event.data);
         }
     };
 
     dataSocket.onerror = (error) => {
-        console.error('WebSocket error:', error);
+        console.error('❌ WebSocket error:', error);
     };
 
     dataSocket.onclose = () => {
-        console.log('WebSocket closed, reconnecting in 3s...');
+        console.log('⚠️ WebSocket closed, reconnecting in 3 seconds...');
         setTimeout(connectWebSocket, 3000);
     };
 
-    // 2. VIDEO SOCKET
-    const videoUrl = `${protocol}//${host}/ws/video/feed`;
+    // 2. VIDEO SOCKET for drone feed
+    const videoUrl = `${API_CONFIG.wsUrl}/ws/video/feed`;
+    console.log('Connecting to Video WebSocket:', videoUrl);
+
     videoSocket = new WebSocket(videoUrl);
     videoSocket.binaryType = "blob";
 
+    videoSocket.onopen = () => {
+        console.log('✅ Video WebSocket connected');
+    };
+
     videoSocket.onmessage = (event) => {
+        // Clean up old URL
         if (lastFrameUrl) {
             URL.revokeObjectURL(lastFrameUrl);
         }
+
+        // Create new URL for this frame
         const url = URL.createObjectURL(event.data);
         lastFrameUrl = url;
 
+        // Update thumbnail if drone selected
         if (selectedDroneId) {
             const thumb = document.getElementById('drone-feed');
             const placeholder = document.querySelector('.no-signal-placeholder');
@@ -115,11 +219,20 @@ function connectWebSocket() {
             }
         }
 
+        // Update fullscreen modal if open
         const modal = document.getElementById('video-modal');
         if (modal && !modal.classList.contains('hidden')) {
             const full = document.getElementById('full-drone-feed');
             if (full) full.src = url;
         }
+    };
+
+    videoSocket.onerror = (error) => {
+        console.error('❌ Video WebSocket error:', error);
+    };
+
+    videoSocket.onclose = () => {
+        console.log('⚠️ Video WebSocket closed');
     };
 }
 
@@ -296,22 +409,38 @@ function filterMap(mode) {
         if (mode === 'all' || mode === 'officers') map.addLayer(officerMarkers[id]);
         else map.removeLayer(officerMarkers[id]);
     });
+
+    Object.keys(aiMarkers).forEach(id => {
+        if (mode === 'all' || mode === 'drones') map.addLayer(aiMarkers[id]);
+        else map.removeLayer(aiMarkers[id]);
+    });
 }
 
 // ==========================================
 // 5. SELECTION & COMMAND PANEL
 // ==========================================
 function selectDrone(id) {
+    // AI surveillance marker should show popup only, not open drone command panel.
+    if (aiDevices[id] && !drones[id]) {
+        if (aiMarkers[id]) {
+            map.flyTo(aiMarkers[id].getLatLng(), 18);
+            aiMarkers[id].openPopup();
+        }
+        return;
+    }
+
     // Close officer panel if open
     deselectOfficer();
 
     selectedDroneId = id;
     document.getElementById('command-panel').classList.remove('hidden');
     if (droneMarkers[id]) map.flyTo(droneMarkers[id].getLatLng(), 18);
+    if (aiMarkers[id]) map.flyTo(aiMarkers[id].getLatLng(), 18);
     isGotoMode = false;
     document.getElementById('btn-goto').classList.remove('active');
     document.getElementById('goto-instruction').classList.add('hidden');
     if (drones[id]) updateCommandPanel(drones[id]);
+    if (aiDevices[id]) updateCommandPanel(aiDevices[id]);
 }
 
 function deselectDrone() {
@@ -341,7 +470,7 @@ async function selectOfficer(id) {
 
     try {
         // Fetch REAL officer data from backend
-        const response = await fetch(`/api/officer/${id}/details`);
+        const response = await fetch(`${API_CONFIG.baseUrl}/api/officer/${id}/details`);
 
         if (response.ok) {
             const officerData = await response.json();
@@ -414,11 +543,29 @@ function updateOfficerPanel(data) {
 }
 
 function updateCommandPanel(data) {
-    document.getElementById('cmd-drone-id').innerText = data.drone_id;
-    document.getElementById('cmd-lat').innerText = data.lat.toFixed(6);
-    document.getElementById('cmd-lng').innerText = data.lng.toFixed(6);
+    const isAi = !!data.device_id;
+    const id = data.drone_id || data.device_id || 'UNKNOWN';
+    const lat = Number(data.lat ?? 0);
+    const lng = Number(data.lng ?? 0);
+    const activeAlerts = Array.isArray(data.active_alerts) ? data.active_alerts : [];
+    const primary = (data.primary_alert || data.alert_type || '').toUpperCase();
 
-    const batt = data.battery || 0;
+    document.getElementById('cmd-drone-id').innerText = id;
+    document.getElementById('cmd-lat').innerText = lat.toFixed(6);
+    document.getElementById('cmd-lng').innerText = lng.toFixed(6);
+
+    const statusEl = document.querySelector('#command-panel .status-indicator');
+    if (statusEl) {
+        if (isAi && activeAlerts.length) {
+            statusEl.innerText = activeAlerts.join(' + ');
+            statusEl.style.color = ['FIGHT', 'WEAPON'].includes(primary) ? '#ff3131' : (primary === 'CROWD' ? '#ffd84d' : '#00ff88');
+        } else {
+            statusEl.innerText = 'OPERATIONAL';
+            statusEl.style.color = '#00ff88';
+        }
+    }
+
+    const batt = isAi ? 100 : (data.battery || 0);
     const bar = document.getElementById('cmd-batt-bar');
     if (bar) {
         bar.style.width = batt + '%';
@@ -610,7 +757,7 @@ setInterval(() => {
 
 async function pollRequests() {
     try {
-        const response = await fetch('/api/admin/requests');
+        const response = await fetch(`${API_CONFIG.baseUrl}/api/admin/requests`);
         const data = await response.json();
         const badge = document.getElementById('request-badge');
         if (data.requests.length > 0) {
@@ -637,7 +784,7 @@ async function fetchAndRenderRequests() {
     grid.innerHTML = '<div style="color:#666; padding:10px; font-family:Rajdhani; text-align:center;">SCANNING NETWORK FOR REQUESTS...</div>';
 
     try {
-        const response = await fetch('/api/admin/requests');
+        const response = await fetch(`${API_CONFIG.baseUrl}/api/admin/requests`);
         const data = await response.json();
         allRequestsData = data.requests;
 
@@ -718,7 +865,7 @@ async function executeApproval() {
     confirmBtn.innerText = "AUTHORIZING...";
 
     try {
-        const response = await fetch(`/api/admin/approve/${currentDossierId}`, { method: 'POST' });
+        const response = await fetch(`${API_CONFIG.baseUrl}/api/admin/approve/${currentDossierId}`, { method: 'POST' });
         const data = await response.json();
 
         if (data.status === 'approved') {
@@ -754,6 +901,173 @@ function showNotification(msg, type) {
     setTimeout(() => div.remove(), 3000);
 }
 
+function getPriorityAlert(alertType, activeAlerts) {
+    const normalized = (activeAlerts || []).map(a => String(a).toUpperCase());
+    if (normalized.includes('WEAPON')) return 'WEAPON';
+    if (normalized.includes('FIGHT')) return 'FIGHT';
+    if (normalized.includes('FIRE')) return 'FIRE';
+    if (normalized.includes('CROWD')) return 'CROWD';
+    return String(alertType || '').toUpperCase();
+}
+
+function createAIMarkerIcon(deviceId, priorityAlert) {
+    const upper = String(priorityAlert || 'NORMAL').toUpperCase();
+    const badgeClass =
+        upper === 'CROWD' ? 'crowd' :
+            (upper === 'FIGHT' || upper === 'WEAPON') ? 'fight' :
+                upper === 'FIRE' ? 'fire' : 'normal';
+
+    return L.divIcon({
+        className: 'tactical-marker',
+        html: `
+            <div class="ai-marker">
+                <div class="ai-circle ${badgeClass}">
+                    <span class="material-icons-round">flight</span>
+                </div>
+                ${upper && upper !== 'NORMAL' ? `<div class="ai-alert-badge ${badgeClass}">${upper}</div>` : ''}
+                <div class="ai-pulse ${badgeClass}"></div>
+                <span class="marker-label">${deviceId}</span>
+            </div>`,
+        iconSize: [48, 48],
+        iconAnchor: [24, 24]
+    });
+}
+
+function handleAILocationUpdate(data) {
+    console.log('AI LOCATION UPDATE:', data);
+
+    const { device_id, name, lat, lng, alert_type, message } = data;
+    const active_alerts = Array.isArray(data.active_alerts) ? data.active_alerts : [];
+    const priorityAlert = getPriorityAlert(data.primary_alert || alert_type, active_alerts);
+
+    aiDevices[device_id] = {
+        ...data,
+        device_id,
+        lat,
+        lng,
+        alert_type,
+        active_alerts,
+        primary_alert: priorityAlert
+    };
+
+    if (!lat || !lng) return;
+
+    if (aiMarkers[device_id]) {
+        aiMarkers[device_id].setLatLng([lat, lng]);
+        aiMarkers[device_id].setIcon(createAIMarkerIcon(device_id, priorityAlert));
+        aiMarkers[device_id].setPopupContent(`
+                <div style="color: #000; font-family: 'Rajdhani', sans-serif;">
+                    <b>${name}</b><br>
+                    <b>Primary:</b> ${priorityAlert || 'NORMAL'}<br>
+                    <b>All Alerts:</b> ${active_alerts.length ? active_alerts.join(', ') : 'NONE'}<br>
+                    <b>Last Coords:</b> ${Number(lat).toFixed(6)}, ${Number(lng).toFixed(6)}<br>
+                    ${message || ''}
+                </div>
+            `);
+    } else {
+        const icon = createAIMarkerIcon(device_id, priorityAlert);
+
+        aiMarkers[device_id] = L.marker([lat, lng], { icon })
+            .on('click', () => aiMarkers[device_id].openPopup())
+            .bindPopup(`
+                <div style="color: #000; font-family: 'Rajdhani', sans-serif;">
+                    <b>${name}</b><br>
+                    <b>Primary:</b> ${priorityAlert || 'NORMAL'}<br>
+                    <b>All Alerts:</b> ${active_alerts.length ? active_alerts.join(', ') : 'NONE'}<br>
+                    <b>Last Coords:</b> ${Number(lat).toFixed(6)}, ${Number(lng).toFixed(6)}<br>
+                    ${message || ''}
+                </div>
+            `);
+
+        if (currentFilter === 'all' || currentFilter === 'drones') {
+            aiMarkers[device_id].addTo(map);
+        }
+    }
+
+    if (selectedDroneId === device_id) {
+        updateCommandPanel(aiDevices[device_id]);
+    }
+}
+
+// Add this to handle AI SOS alerts
+function handleAISOSAlert(data) {
+    console.log('AI SOS ALERT:', data);
+
+    const { device_id, name, lat, lng, alert_type, message } = data;
+    const normalizedType = String(alert_type || '').toLowerCase();
+    const locKey = lat && lng ? `${Number(lat).toFixed(3)},${Number(lng).toFixed(3)}` : 'unknown';
+
+    // Suppress duplicate emergency entries for same type+location.
+    const duplicate = emergencyAlerts.find(a =>
+        a.officer_id === device_id &&
+        String(a.emergency_type || '').toLowerCase() === normalizedType &&
+        a.location_key === locKey
+    );
+    if (duplicate) {
+        duplicate.message = message || duplicate.message;
+        duplicate.time = data.triggered_at || new Date().toISOString();
+        emergencyAlerts = [duplicate, ...emergencyAlerts.filter(a => a !== duplicate)];
+        updateAlertsDisplay();
+        return;
+    }
+
+    // Fight priority over crowd at same location.
+    if (normalizedType === 'crowd') {
+        const fightExists = emergencyAlerts.find(a =>
+            a.officer_id === device_id &&
+            String(a.emergency_type || '').toLowerCase() === 'fight' &&
+            a.location_key === locKey
+        );
+        if (fightExists) return;
+    }
+
+    if (normalizedType === 'fight') {
+        emergencyAlerts = emergencyAlerts.filter(a =>
+            !(
+                a.officer_id === device_id &&
+                String(a.emergency_type || '').toLowerCase() === 'crowd' &&
+                a.location_key === locKey
+            )
+        );
+    }
+
+    playEmergencySound();
+    showBrowserNotification(`ALERT ${alert_type.toUpperCase()}`, message);
+
+    if (lat && lng) {
+        map.flyTo([lat, lng], 16, { duration: 1.5 });
+    }
+
+    const alert = {
+        id: `ai_${Date.now()}`,
+        officer_id: device_id,
+        officer_name: name,
+        lat,
+        lng,
+        emergency_type: alert_type,
+        location_key: locKey,
+        message: message,
+        time: data.triggered_at
+    };
+
+    emergencyAlerts.unshift(alert);
+    updateAlertsDisplay();
+}
+
+// Update the WebSocket message handler
+// Find the dataSocket.onmessage section and add these cases:
+/*
+} else if (data.type === 'ai_location_update') {
+    handleAILocationUpdate(data);
+} else if (data.type === 'ai_sos_alert') {
+    handleAISOSAlert(data);
+}
+*/
+
+
+
 // Initialize
 initOfficers();
 connectWebSocket();
+
+

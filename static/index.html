@@ -10,6 +10,7 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="notification-styles.css">
     <link
         href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Inter:wght@400;500&display=swap"
         rel="stylesheet">
@@ -28,6 +29,17 @@
         </div>
 
         <div class="hud-module top-right profile-module">
+            <div class="notification-controls">
+                <button class="notification-btn" id="alerts-btn" onclick="toggleAlertsPanel()" title="Emergency Alerts">
+                    <span class="material-icons-round">crisis_alert</span>
+                    <span id="alerts-badge" class="notif-badge hidden">0</span>
+                </button>
+                <button class="notification-btn" id="notif-btn" onclick="toggleNotificationPanel()"
+                    title="Notifications">
+                    <span class="material-icons-round">notifications</span>
+                    <span id="notif-badge" class="notif-badge hidden">0</span>
+                </button>
+            </div>
             <div class="temporal-data">
                 <span class="clock-label">SYSTEM TIME</span>
                 <span id="clock" class="tactical-clock">00:00:00</span>
@@ -83,6 +95,10 @@
                             <span class="material-icons-round item-icon">verified_user</span>
                             <span class="item-text">Access Requests</span>
                             <span id="request-badge" class="badge hidden">0</span>
+                        </button>
+                        <button class="dropdown-item" onclick="openSendNotificationModal()">
+                            <span class="material-icons-round item-icon">send</span>
+                            <span class="item-text">Send Notification</span>
                         </button>
                         <button class="dropdown-item">
                             <span class="material-icons-round item-icon">settings</span>
@@ -379,7 +395,85 @@
         </div>
     </div>
 
+    <!-- Send Notification Modal -->
+    <div id="send-notification-modal" class="modal-overlay hidden">
+        <div class="modal-container medium tactical-glass">
+            <div class="modal-header">
+                <div class="header-content">
+                    <span class="modal-icon material-icons-round">send</span>
+                    <span class="modal-title">SEND NOTIFICATION <span class="accent">// TO OFFICERS</span></span>
+                </div>
+                <button class="modal-close" onclick="closeSendNotificationModal()">✕</button>
+            </div>
+
+            <div class="dossier-body">
+                <div style="padding: 20px;">
+                    <div style="margin-bottom: 20px;">
+                        <label
+                            style="display: block; margin-bottom: 8px; color: #ccc; font-size: 12px; font-weight: 600;">NOTIFICATION
+                            TITLE</label>
+                        <input type="text" id="notif-title" placeholder="Enter notification title..."
+                            style="width: 100%; padding: 12px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; color: #fff; font-family: 'Inter', sans-serif;">
+                    </div>
+
+                    <div style="margin-bottom: 20px;">
+                        <label
+                            style="display: block; margin-bottom: 8px; color: #ccc; font-size: 12px; font-weight: 600;">MESSAGE</label>
+                        <textarea id="notif-message" placeholder="Enter your message..." rows="4"
+                            style="width: 100%; padding: 12px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; color: #fff; font-family: 'Inter', sans-serif; resize: vertical;"></textarea>
+                    </div>
+
+                    <button class="tactical-btn approve-btn" onclick="sendNotificationToOfficers()"
+                        style="width: 100%;">
+                        <span class="material-icons-round">send</span> SEND TO ALL OFFICERS
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notification Panel -->
+    <div id="notification-panel" class="notification-panel hidden">
+        <div class="panel-header">
+            <h3><span class="material-icons-round">notifications</span> Notifications</h3>
+            <button class="close-panel-btn" onclick="toggleNotificationPanel()">
+                <span class="material-icons-round">close</span>
+            </button>
+        </div>
+        <div id="notification-list" class="notification-list">
+            <div class="empty-state">
+                <span class="material-icons-round">notifications_none</span>
+                <p>No notifications</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Emergency Alerts Panel -->
+    <div id="alerts-panel" class="notification-panel alerts-panel hidden">
+        <div class="panel-header alert-header">
+            <h3><span class="material-icons-round">crisis_alert</span> Emergency Alerts</h3>
+            <button class="close-panel-btn" onclick="toggleAlertsPanel()">
+                <span class="material-icons-round">close</span>
+            </button>
+        </div>
+        <div id="alerts-list" class="notification-list">
+            <div class="empty-state">
+                <span class="material-icons-round">shield</span>
+                <p>No active emergencies</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Audio Alert for Emergencies -->
+    <audio id="emergency-alert-sound" preload="auto">
+        <source
+            src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUKzn77RgGwU7k9nyyXksBSh+zPLaizsKElyx6OyrWBUIQ6Hh8r1rIAUsgs/y2Ik2CBlpu/DknE4MDlCs5++0YBsFO5PZ8sl5LAUofszy2os7ChJcsevsq1gVCEOh4fK9ayAFLILP8tiJNggZabvw5JxODA5QrOfvtGAbBTuT2fLJeSwFKH7M8tqLOwoSXLHr7KtYFQhDoeHyvWsgBSyCz/LYiTYIGWm78OScTgwOUKzn77RgGwU7k9nyyXksBSh+zPLaizsKElyx6+yrWBUIQ6Hh8r1rIAUsgs/y2Ik2CBlpu/DknE4MDlCs5++0YBsFO5PZ8sl5LAUofszy2os7ChJcsevsq1gVCEOh4fK9ayAFLILP8tiJNggZabvw5JxODA5QrOfvtGAbBTuT2fLJeSwFKH7M8tqLOwoSXLHr7KtYFQhDoeHyvWsgBSyCz/LYiTYIGWm78OScTgwOUKzn77RgGwU7k9nyyXksBSh+zPLaizsKElyx6+yrWBUIQ6Hh8r1rIAUsgs/y2Ik2CBlpu/DknE4MDlCs5++0YBsFO5PZ8sl5LAUofszy2os7ChJcsevsq1gVCEOh4fK9ayAFLILP8tiJNggZabvw5JxODA5QrOfvtGAbBTuT2fLJeSwFKH7M8tqLOwoSXLHr7KtYFQhDoeHyvWsgBSyCz/LYiTYIGWm78OScTgwOUKzn77RgGwU7k9nyyXksBSh+zPLaizsKElyx6+yrWBUIQ6Hh8r1rIAUsgs/y2Ik2CBlpu/DknE4MDlCs5++0YBsFO5PZ8sl5LAUofszy2os7ChJcsevsq1gVCEOh4fK9ayAFLILP8tiJNggZabvw5JxODA5QrOfvtGAbBTuT2fLJeSwFKH7M8tqLOwoSXLHr7KtYFQhDoeHyvWsgBSyCz/LYiTYIGWm78OScTgwOUKzn77RgGwU7k9nyyXksBSh+zPLaizsKElyx6+yrWBUIQ6Hh8r1rIAUsgs/y2Ik2CBlpu/DknE4MDlCs5++0YBsFO5PZ8sl5LAUofszy2os7ChJcsevsq1gVCEOh4fK9ayAFLILP8tiJNggZabvw5JxODA5QrOfvtGAbBTuT2fLJeSwFKH7M8tqLOwoSXLHr7KtYFQhDoeHyvWsgBQ=="
+            type="audio/wav">
+    </audio>
+
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="notification-handlers.js"></script>
+    <script src="send-notification.js"></script>
     <script src="script.js"></script>
 </body>
 

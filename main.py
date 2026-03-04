@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Set
 from dotenv import load_dotenv
 
@@ -63,6 +63,19 @@ class LocationUpdate(BaseModel):
 class StatusUpdate(BaseModel):
     is_live: bool
     nickname: str | None = None
+
+
+class SurveillanceAlert(BaseModel):
+    alert_type: str  # "FIGHT", "WEAPON", "FIRE", "CROWD"
+    count: int
+    message: str
+    latitude: float | None = None
+    longitude: float | None = None
+    timestamp: str | None = None
+    source: str | None = "AI_SURVEILLANCE"
+    device_id: str | None = None
+    active_alerts: List[str] | None = None
+    primary_alert: str | None = None
 
 
 @dataclass
@@ -414,6 +427,14 @@ notifications_lock = asyncio.Lock()
 clients_lock = asyncio.Lock()
 
 STALE_AFTER = timedelta(seconds=90)
+
+# Surveillance dedup cache to prevent repeated crowd/fight spam per location
+SURVEILLANCE_DEDUP_SECONDS = {
+    "CROWD": 180,
+    "FIGHT": 120,
+}
+surveillance_alert_cache: Dict[str, datetime] = {}
+surveillance_alert_lock = asyncio.Lock()
 
 
 # --- NEW: LOAD DATA ON STARTUP ---
@@ -1683,6 +1704,113 @@ async def test_emergency(payload: EmergencyTest) -> Dict[str, Any]:
     }
 
 
+@app.post("/api/surveillance/app-alert")
+async def surveillance_app_alert(payload: SurveillanceAlert):
+    """
+    Endpoint for AI Surveillance App (laptop) to send alerts (FIGHT, WEAPON, FIRE).
+    Broadcasts to dashboard and sends FCM to officers.
+    """
+    print(f"🚨 AI SURVEILLANCE ALERT: {payload.alert_type} - {payload.message}")
+    print(f"   Location: ({payload.latitude}, {payload.longitude})")
+
+    now = datetime.utcnow()
+
+    # 1. Create a persistent notification for DB and Dashboard
+    notification_id = await create_notification(
+        notification_type="emergency",
+        title=f"🚨 {payload.alert_type} DETECTED",
+        message=payload.message,
+        lat=payload.latitude,
+        lng=payload.longitude,
+        metadata={
+            "source": "AI_SURVEILLANCE",
+            "count": payload.count,
+            "alert_type": payload.alert_type,
+            "ai_triggered": True,
+        },
+    )
+
+    # 2. Broadcast AI Location Update first (to ensure marker exists on dashboard)
+    await broadcast(
+        {
+            "type": "officer_location_update",
+            "officer_id": "AI_SURVEILLANCE",
+            "officer_name": "TRINETRA AI / LAPTOP",
+            "badge_number": "SYSTEM",
+            "is_online": True,
+            "lat": payload.latitude,
+            "lng": payload.longitude,
+            "timestamp": now.isoformat(),
+        }
+    )
+
+    # 3. Broadcast SOS Alert to trigger Red UI on Dashboard
+    # Using 'AI_SURVEILLANCE' as a special ID
+
+    # Calculate a radius for map visualization
+    radius_m = 50.0  # Default
+    if payload.alert_type == "CROWD":
+        radius_m = max(50.0, float(payload.count) * 5.0)
+    elif payload.alert_type == "FIRE":
+        radius_m = 80.0
+
+    await broadcast(
+        {
+            "type": "officer_sos_alert",
+            "officer_id": "AI_SURVEILLANCE",
+            "officer_name": "TRINETRA AI",
+            "badge_number": "SYSTEM",
+            "lat": payload.latitude,
+            "lng": payload.longitude,
+            "sos_active": True,
+            "emergency_type": payload.alert_type.lower(),
+            "emergency_radius": radius_m,
+            "message_text": payload.message,
+            "triggered_at": now.isoformat(),
+            "notification_id": notification_id,
+        }
+    )
+
+    # 4. Send FCM push notification to ALL officers
+    if firebase_app:
+        try:
+            # Send as normal notification (broadcast)
+            await send_fcm_normal_notification(
+                title=f"🚨 {payload.alert_type} DETECTED!", message=payload.message
+            )
+
+            # Also send as emergency if critical
+            if payload.alert_type in ["FIGHT", "WEAPON", "FIRE", "CROWD"]:
+                # We broadcast to all officers by passing None as officer_ids to send_fcm_notification indirectly
+                # or just use send_fcm_normal_notification which already broadcasts.
+                # However, for the proper "Emergency" UI on the phone, we should use send_fcm_emergency_alert.
+                # Since send_fcm_emergency_alert requires nearby officers, we'll find them or just broadcast to everyone.
+
+                # Broadly search for officers if location is available
+                nearby_officers = []
+                if payload.latitude and payload.longitude:
+                    nearby_officers = find_nearby_officers(
+                        "AI_SURVEILLANCE",
+                        payload.latitude,
+                        payload.longitude,
+                        radius_km=10.0,
+                    )
+
+                await send_fcm_emergency_alert(
+                    officer_id="AI_SURVEILLANCE",
+                    officer_name="TRINETRA AI",
+                    badge_number="SYSTEM",
+                    lat=payload.latitude or 0.0,
+                    lng=payload.longitude or 0.0,
+                    emergency_type=payload.alert_type.lower(),
+                    message_text=payload.message,
+                )
+        except Exception as e:
+            print(f"⚠️ FCM surveillance alert failed: {e}")
+
+    return {"ok": True, "notification_id": notification_id}
+
+
 @app.websocket("/ws/locations")
 async def websocket_locations(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -2526,6 +2654,147 @@ async def test_send_emergency(
     return {"ok": True, "fcm_result": result}
 
 
+@app.post("/api/surveillance/alert")
+async def surveillance_alert(payload: SurveillanceAlert):
+    """
+    Endpoint for AI Surveillance to send alerts
+    """
+    alert_type = (payload.alert_type or "UNKNOWN").upper()
+    active_alerts = [a.upper() for a in (payload.active_alerts or [])]
+    primary_alert = (payload.primary_alert or alert_type).upper()
+    device_id = payload.device_id or "AI_SURVEILLANCE"
+    lat = payload.latitude
+    lng = payload.longitude
+    now = datetime.now(timezone.utc)
+
+    print(f"AI SURVEILLANCE ALERT: {alert_type}")
+    print(f"   Location: {lat}, {lng}")
+    print(f"   Message: {payload.message}")
+
+    location_key = f"{lat:.3f},{lng:.3f}" if lat is not None and lng is not None else "unknown"
+
+    # State updates are for live marker/popup context only, not emergency feed entries.
+    if alert_type == "STATE_UPDATE":
+        await broadcast(
+            {
+                "type": "ai_location_update",
+                "device_id": device_id,
+                "name": "TRINETRA AI",
+                "lat": lat,
+                "lng": lng,
+                "alert_type": alert_type,
+                "primary_alert": primary_alert,
+                "active_alerts": active_alerts,
+                "message": payload.message,
+                "timestamp": now.isoformat(),
+            }
+        )
+        return {"ok": True, "suppressed": True, "reason": "state_only"}
+
+    # Fight gets priority over crowd from same frame/device.
+    if alert_type == "CROWD" and ("FIGHT" in active_alerts or primary_alert == "FIGHT"):
+        await broadcast(
+            {
+                "type": "ai_location_update",
+                "device_id": device_id,
+                "name": "TRINETRA AI",
+                "lat": lat,
+                "lng": lng,
+                "alert_type": alert_type,
+                "primary_alert": "FIGHT",
+                "active_alerts": active_alerts,
+                "message": payload.message,
+                "timestamp": now.isoformat(),
+            }
+        )
+        return {"ok": True, "suppressed": True, "reason": "fight_priority"}
+
+    # Deduplicate repeated crowd/fight events at same location.
+    dedup_key = f"{alert_type}:{location_key}"
+    dedup_seconds = SURVEILLANCE_DEDUP_SECONDS.get(alert_type, 0)
+    if dedup_seconds > 0:
+        async with surveillance_alert_lock:
+            last_sent = surveillance_alert_cache.get(dedup_key)
+            if last_sent and (now - last_sent).total_seconds() < dedup_seconds:
+                await broadcast(
+                    {
+                        "type": "ai_location_update",
+                        "device_id": device_id,
+                        "name": "TRINETRA AI",
+                        "lat": lat,
+                        "lng": lng,
+                        "alert_type": alert_type,
+                        "primary_alert": primary_alert,
+                        "active_alerts": active_alerts,
+                        "message": payload.message,
+                        "timestamp": now.isoformat(),
+                    }
+                )
+                return {"ok": True, "suppressed": True, "reason": "duplicate_location"}
+            surveillance_alert_cache[dedup_key] = now
+
+    notification_id = await create_notification(
+        notification_type="emergency",
+        title=f"{alert_type} DETECTED",
+        message=payload.message,
+        lat=lat,
+        lng=lng,
+        metadata={
+            "source": payload.source,
+            "count": payload.count,
+            "alert_type": alert_type,
+            "device_id": device_id,
+            "active_alerts": active_alerts,
+            "primary_alert": primary_alert,
+        },
+    )
+
+    await broadcast(
+        {
+            "type": "ai_location_update",
+            "device_id": device_id,
+            "name": "TRINETRA AI",
+            "lat": lat,
+            "lng": lng,
+            "alert_type": alert_type,
+            "primary_alert": primary_alert,
+            "active_alerts": active_alerts,
+            "message": payload.message,
+            "timestamp": now.isoformat(),
+        }
+    )
+
+    await broadcast(
+        {
+            "type": "ai_sos_alert",
+            "device_id": device_id,
+            "name": "TRINETRA AI",
+            "lat": lat,
+            "lng": lng,
+            "alert_type": alert_type.lower(),
+            "message": payload.message,
+            "triggered_at": now.isoformat(),
+            "notification_id": notification_id,
+        }
+    )
+
+    if firebase_app:
+        try:
+            nearby_officers: List[str] | None = None
+            if lat is not None and lng is not None:
+                nearby_officers = find_nearby_officers(device_id, lat, lng, radius_km=5.0)
+
+            await send_fcm_normal_notification(
+                title=f"{alert_type} DETECTED!",
+                message=payload.message,
+                target_officer_ids=nearby_officers if nearby_officers else None,
+            )
+        except Exception as e:
+            print(f"FCM failed: {e}")
+
+    return {"ok": True, "notification_id": notification_id}
+
+
 # Mount static files at root to serve index.html, script.js, style.css
 # This must be the last route defined to act as a fallback for the SPA
 app.mount("/", StaticFiles(directory="static", html=True), name="static_root")
@@ -2535,3 +2804,4 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
